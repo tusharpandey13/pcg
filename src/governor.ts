@@ -160,6 +160,8 @@ export const checkpointPrompt = (awt: boolean): string =>
 		: `Write a handoff to ${HANDOFF_FILE} (create the directory): goal, state, decisions, files, next steps. `) +
 	"Then reply with that handoff in under 300 words.";
 
+const EXPIRED = "AWS credentials expired";
+const NO_RESPONSE = "AWS credentials unavailable";
 const usd = (n: number) => (Number.isFinite(n) ? `$${n.toFixed(n < 0.1 ? 3 : 2)}` : "unknown");
 const k = (n: number) => `${Math.round(n / 1000)}K`;
 const MIN = 60_000;
@@ -271,6 +273,13 @@ export default function governor(pi: ExtensionAPI) {
 
 	// Feature 1 + 2 + 3: decide each refresh.
 	on("cache_warming_decision", (ev, ctx) => {
+		if (refreshing) {
+			// The previous refresh never got an HTTP response: credentials (for example a
+			// credential_process that needs MFA) or the network failed. Retrying would re-run the
+			// credential helper every few minutes, and the cache is probably lost already.
+			authExpired = true;
+			ctx.ui.setStatus("governor", NO_RESPONSE);
+		}
 		refreshing = false;
 		if (authExpired) return { action: "stop" };
 		const branch: Entry[] = ctx.sessionManager.getBranch();
@@ -292,11 +301,19 @@ export default function governor(pi: ExtensionAPI) {
 
 	// Feature 2: a refresh gets its response through the same hook as real requests.
 	on("after_provider_response", (ev, ctx) => {
-		if (!refreshing || !ctx.isIdle()) return;
+		// Any HTTP response proves credentials and network work, so it ends the "no response" watch.
+		// Only a response while idle can be the refresh's own, so only then do statuses count.
+		const ours = refreshing && ctx.isIdle();
 		refreshing = false;
+		if (!ours) return;
+		if (ev.status >= 400) {
+			// Evidence for which statuses mean "credentials expired" on each provider; only 401 and 403 act.
+			const type = ev.headers?.["x-amzn-errortype"] ?? ev.headers?.["X-Amzn-ErrorType"];
+			pi.appendEntry("governor-log", { msg: `refresh failed: status ${ev.status}${type ? ` (${type})` : ""}` });
+		}
 		if (ev.status === 401 || ev.status === 403) {
 			authExpired = true;
-			ctx.ui.setStatus("governor", "SSO expired");
+			ctx.ui.setStatus("governor", EXPIRED);
 		}
 	});
 	on("agent_start", (_e, ctx) => {
@@ -446,7 +463,7 @@ export default function governor(pi: ExtensionAPI) {
 					`Rewrites avoided: ${r.rewritesAvoided}   saved: ${usd(r.saved)}   net: ${usd(r.net)}`,
 					`Config: checkpoint>=${k(cfg.checkpointMinTokens)} rollover>${cfg.rolloverTokens ? k(cfg.rolloverTokens) : "off"} ask=${cfg.askOnReturn} prices(in/write/read/out)=${p.input}/${p.cacheWrite}/${p.cacheRead}/${p.output}` +
 						(wakes.size ? `   wakes expected: ${wakes.size}` : "") +
-						(authExpired ? "   SSO expired" : ""),
+						(authExpired ? "   warming stopped: AWS credentials expired or unavailable" : ""),
 				].join("\n"),
 				"info",
 			);

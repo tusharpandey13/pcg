@@ -27,7 +27,16 @@ Refreshes are counted by warm decisions, so a failed refresh (500, 429, timeout)
 
 ### 2. Stop on auth errors
 
-SSO sessions expire. A refresh that gets a 401 or 403 stops warming until the next real request, instead of retrying every 4.5 minutes. The status line shows "SSO expired".
+Credentials expire, whether they come from an SSO profile or a `credential_process` helper. Warming stops until the next real request, instead of retrying every 4.5 minutes, in two cases:
+
+- A refresh gets a 401 or 403. The status line shows "AWS credentials expired".
+- A refresh gets no HTTP response at all before the next warming decision. The status line shows "AWS credentials unavailable".
+
+The second case is how a `credential_process` failure looks: the AWS SDK runs the helper before sending, and a helper that needs the user (an MFA approval, a login) fails inside the SDK, so no response arrives. Stopping on the first miss is deliberate, because each retry would run the helper again, possibly sending another MFA prompt. A network drop looks the same and is handled the same way.
+
+Any HTTP response, even one that arrives while a turn is running, ends this watch, because it proves credentials and network work. Only responses while idle count as the refresh's own status.
+
+Neither case writes a checkpoint, because a checkpoint needs a working connection. Every failed refresh's status and `x-amzn-errortype` are logged in the session as evidence. That way it can be confirmed which other statuses, if any, also mean expired credentials, without guessing.
 
 ### 3. Checkpoint while warm
 
@@ -90,7 +99,7 @@ All settings live in one block in pi's settings, with these defaults:
 
 ## Setup the user does once (work Mac)
 
-1. Install pi and point it at the SSO profile (`AWS_PROFILE`).
+1. Install pi and point it at an AWS profile (`AWS_PROFILE`): either an SSO profile or one with a `credential_process` helper. Set the profile for pi only.
 2. Pin the model to one region rather than a cross-region inference profile, since a request served from another region writes a new cache entry.
 3. Set `cacheWarming: "idle"` and `"promptCache": {"short": 300}` for the model.
 4. Install the governor extension.

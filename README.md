@@ -15,7 +15,7 @@ pi already has a cache warmer that refreshes the cache before it expires, but it
 | Situation | What pcg does |
 |---|---|
 | A wake is certain, such as a worker still running that will report back | Keeps warming until the wake arrives, up to the break-even point or pi's 30-minute idle limit |
-| The SSO session expired, so a refresh gets a 401 or 403 | Stops warming instead of retrying every 4.5 minutes, and shows "SSO expired" |
+| Credentials expired: a refresh gets a 401 or 403, or gets no response at all (for example a credential helper waiting on MFA) | Stops warming instead of retrying every 4.5 minutes, and shows "AWS credentials expired" or "AWS credentials unavailable". The next real request recovers. |
 | Warming is about to stop and the context is large | Writes a **checkpoint** as a turn inside the session while the cache is warm, at about 0.1× the context |
 | You return after the cache expired and a checkpoint exists | Asks once: resume the full context, or continue from the checkpoint in a fresh session, with dollar estimates for each |
 | The context passes a size cap (200K tokens by default) | Hands off while warm, rolls over to a fresh session, and tells you |
@@ -37,7 +37,20 @@ pi loads TypeScript directly, so there is no build step, and pcg has no runtime 
 
 ## Setup
 
-1. **Credentials.** For Bedrock with SSO: `export AWS_PROFILE=<your-sso-profile>`, then `aws sso login`. Set `AWS_REGION` if the profile doesn't.
+1. **Credentials.** Either route works, because pi uses the standard AWS credential chain:
+   - **SSO profile:** `aws sso login --profile <your-sso-profile>`, then run pi with that profile.
+   - **`credential_process`,** for managed setups where a helper prints short-lived credentials as JSON (`Version`, `AccessKeyId`, `SecretAccessKey`, `SessionToken`, `Expiration`). Add a profile to `~/.aws/config`:
+     ```ini
+     [profile pcg-bedrock]
+     region = us-east-1
+     credential_process = /path/to/your-credential-helper
+     ```
+
+   Set the profile for pi only, not globally, so other tools keep their own credentials. A shell alias does this:
+   ```bash
+   alias pi='AWS_PROFILE=pcg-bedrock command pi'
+   ```
+   Set `AWS_REGION` if the profile doesn't, and `AWS_CA_BUNDLE` if your network uses a proxy certificate.
 2. **One region.** Pick a plain regional model ID, not a `us.` or `global.` cross-region inference profile. A request served from another region writes a new cache entry, which defeats warming.
 3. **Turn on idle warming.** In `~/.pi/agent/settings.json`:
    ```json
@@ -91,10 +104,11 @@ Work in pi as usual. pcg only acts when you pause or the context grows.
 
 - **Warming beyond 30 minutes isn't possible.** pi caps idle warming at 30 minutes, so a longer wait ends in a checkpoint.
 - **The checkpoint estimate is low.** It counts only the handoff, not writing pi's system prompt and tools again in the new session, so the real cost is a few cents more.
+- **Warming stops on the first refresh with no response.** Near a 5-minute lifetime, a missed refresh has probably lost the cache already, and retrying would run your credential helper again, which may mean another MFA prompt each time. A network drop has the same effect. The next real request recovers.
 - **The handoff is only as good as the model's summary.** Continuing from a checkpoint is cheaper but loses detail that the full context would keep.
 - **Not yet confirmed against real Bedrock:**
-  - that 401 and 403 errors reach the extension;
-  - that a single-region model ID gets cache hits;
+  - which HTTP statuses Bedrock returns for expired credentials. pcg acts on 401 and 403 only, and logs every failed refresh's status and `x-amzn-errortype` in the session (`governor-log` entries), so this can be checked;
+  - that a single-region model ID gets cache hits. Check with `/governor` after two turns: refreshes should show cache reads, and writes on every refresh mean the region or model ID doesn't match;
   - real handoff quality;
   - pi's own selection menu.
 

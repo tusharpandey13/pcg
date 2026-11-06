@@ -58,8 +58,59 @@ describe("feature 1: wake-aware warming", () => {
 		expectWake(g.pi, "w2");
 		expectWake(g.pi, "w1", false);
 		expect(await g.fire("cache_warming_decision", dec("stop"))).toEqual({ action: "warm" });
+		await g.fire("after_provider_response", { status: 200, headers: {} });
 		expectWake(g.pi, "w2", false);
 		expect(await g.fire("cache_warming_decision", dec("warm"))).toBeUndefined();
+	});
+});
+
+describe("feature 2b: a refresh with no response stops warming", () => {
+	it("stops at the next decision when the refresh never got an HTTP response, and says why", async () => {
+		const g = setup({ branch: big() });
+		g.fire("session_start");
+		expect(await g.fire("cache_warming_decision", dec("warm"))).toBeUndefined(); // refresh goes out, no response follows
+		expect(await g.fire("cache_warming_decision", dec("warm"))).toEqual({ action: "stop" });
+		expect(g.ui.setStatus).toHaveBeenCalledWith("governor", "AWS credentials unavailable");
+		expect(g.sent).toHaveLength(0); // no checkpoint: it would need a working connection
+	});
+
+	it("recovers on the next real request: status cleared, warming allowed again", async () => {
+		const g = setup({ branch: big() });
+		g.fire("session_start");
+		await g.fire("cache_warming_decision", dec("warm"));
+		await g.fire("cache_warming_decision", dec("warm"));
+		g.fire("agent_start");
+		expect(g.ui.setStatus).toHaveBeenLastCalledWith("governor", undefined);
+		expect(await g.fire("cache_warming_decision", dec("warm"))).toBeUndefined();
+	});
+
+	it("a refresh that got a normal response does not stop warming", async () => {
+		const g = setup({ branch: big() });
+		g.fire("session_start");
+		for (let i = 0; i < 4; i++) {
+			expect(await g.fire("cache_warming_decision", dec("warm"))).toBeUndefined();
+			await g.fire("after_provider_response", { status: 200, headers: {} });
+		}
+		expect(g.ui.setStatus).not.toHaveBeenCalledWith("governor", "AWS credentials unavailable");
+	});
+
+	it("a response that arrives while a turn runs still counts as a response", async () => {
+		const g = setup({ branch: big() });
+		g.fire("session_start");
+		await g.fire("cache_warming_decision", dec("warm"));
+		g.ctx.isIdle = () => false;
+		await g.fire("after_provider_response", { status: 200, headers: {} });
+		g.ctx.isIdle = () => true;
+		expect(await g.fire("cache_warming_decision", dec("warm"))).toBeUndefined();
+	});
+
+	it("logs the status and error type of a failed refresh, as evidence for which codes mean expired credentials", async () => {
+		const g = setup({ branch: big() });
+		g.fire("session_start");
+		await g.fire("cache_warming_decision", dec("warm"));
+		await g.fire("after_provider_response", { status: 400, headers: { "x-amzn-errortype": "ExpiredTokenException" } });
+		expect(g.entries.some((e) => e.type === "governor-log" && /400 \(ExpiredTokenException\)/.test(e.data.msg))).toBe(true);
+		expect(await g.fire("cache_warming_decision", dec("warm"))).toBeUndefined(); // 400 alone does not stop warming yet
 	});
 });
 
@@ -72,7 +123,7 @@ describe("feature 2: stop on auth errors", () => {
 		const g = setup({ branch: big() });
 		g.fire("session_start");
 		await refresh(g, status);
-		expect(g.ui.setStatus).toHaveBeenCalledWith("governor", "SSO expired");
+		expect(g.ui.setStatus).toHaveBeenCalledWith("governor", "AWS credentials expired");
 		expect(await g.fire("cache_warming_decision", dec("warm"))).toEqual({ action: "stop" });
 		expect(g.sent).toHaveLength(0); // no checkpoint: it would fail too
 		g.fire("agent_start");

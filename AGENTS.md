@@ -10,7 +10,8 @@ pcg is a pi extension that decides when to keep a prompt cache warm, when to che
 
 - **A checkpoint is a turn inside the current session**, so it reads the warm cache. Never write a handoff with a separate model request: that reads the whole context at full input price.
 - **At most one checkpoint attempt per idle period.** A checkpoint or rollover must never trigger another.
-- **Warming always ends:** at the break-even cap, at pi's 30-minute idle limit, or on a 401 or 403.
+- **Warming always ends:** at the break-even cap, at pi's 30-minute idle limit, or on a 401, a 403, or a refresh with no response.
+- **Don't add an HTTP status to the auth stop without evidence.** Failed refreshes are logged with their status and `x-amzn-errortype`; use those logs.
 - **Never lose the user's message.** Messages typed during a checkpoint are held and sent afterwards, and a failed session switch delivers to the current session.
 - **No unannounced session switch.** The user is either asked or told.
 - **No handler may throw into pi.** Use the `guard` and `fin` helpers.

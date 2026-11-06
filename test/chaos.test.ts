@@ -36,6 +36,7 @@ describe("time", () => {
 		vi.setSystemTime(T0 + 24.5 * MIN);
 		expect(await s.ops.fire("cache_warming_decision", { action: "warm" })).toBeUndefined();
 		expect(cpPrompts(s)).toBe(0);
+		await s.ops.fire("after_provider_response", { status: 200, headers: {} }); // the refresh succeeded
 		vi.setSystemTime(T0 + 24.5 * MIN + 1);
 		expect(await s.ops.fire("cache_warming_decision", { action: "warm" })).toEqual({ action: "stop" });
 		expect(cpPrompts(s)).toBe(1);
@@ -310,7 +311,7 @@ describe("provider and usage", () => {
 		await s.ops.decide("stop");
 		await s.ops.status(code);
 		expect(await s.ops.fire("cache_warming_decision", { action: "warm" })).toEqual({ action: "stop" });
-		expect(s.g.ui.setStatus).toHaveBeenCalledWith("governor", "SSO expired");
+		expect(s.g.ui.setStatus).toHaveBeenCalledWith("governor", "AWS credentials expired");
 		await s.ops.fire("agent_start");
 		expect(s.g.ui.setStatus).toHaveBeenLastCalledWith("governor", undefined);
 		expect(await s.ops.fire("cache_warming_decision", { action: "stop" })).toEqual({ action: "warm" });
@@ -354,6 +355,28 @@ describe("provider and usage", () => {
 		s.ops.wake("w", true);
 		expect(await s.ops.fire("cache_warming_decision", { action: "warm" })).toEqual({ action: "warm" });
 		expect(s.g.ui.setStatus).not.toHaveBeenCalled();
+	});
+
+	it("dropped refresh responses: warming ends at the first drop, a refresh made during a turn never false-stops, and the next real request recovers", async () => {
+		atk();
+		const r = rng(SEED + 17);
+		for (let run = 0; run < 40; run++) {
+			const s = mkSim(); await start(s);
+			if (r.chance(0.5)) s.ops.wake("w", true);
+			const dropAt = r.int(6);
+			let stopped = -1;
+			for (let i = 0; i < 8; i++) {
+				const a = (await s.ops.decide("warm"))?.action ?? "warm";
+				if (stopped < 0 && a === "stop") stopped = i;
+				if (i === dropAt) s.ops.drop();
+			}
+			expect(stopped, `run ${run}`).toBe(dropAt + 1);
+			expect(s.g.ui.setStatus).toHaveBeenCalledWith("governor", "AWS credentials unavailable");
+			await s.ops.user("back");
+			expect((await s.ops.decide("warm"))?.action ?? "warm", `run ${run} recovers`).not.toBe("stop");
+			expect(s.decisionViolations).toEqual([]);
+			expect(s.errors).toEqual([]);
+		}
 	});
 
 	it("a stray 401 while idle but not refreshing is ignored", async () => {
@@ -648,7 +671,7 @@ describe("seeded random interleavings", () => {
 					case 3: s.ops.jump(r.pick([-60 * MIN, -MIN, 1, MIN, 5 * MIN, 24.5 * MIN, 40 * MIN, 3 * 24 * 60 * MIN])); break;
 					case 4: case 5: await s.ops.decide(r.pick(["warm", "stop"] as const), { append: r.chance(0.8) }); break;
 					case 6: s.ops.wake(`w${r.int(3)}`, r.chance(0.6)); break;
-					case 7: await s.ops.status(r.pick([401, 403, 429, 500, 200, 0])); break;
+					case 7: if (r.chance(0.25)) s.ops.drop(); else await s.ops.status(r.pick([401, 403, 429, 500, 200, 0])); break;
 					case 8: await s.ops.finish(r.pick(["ok", "ok", "ok", "abort", "error"] as const)); break;
 					case 9: await s.ops.user("big", r.pick([250_000, 400_000])); break;
 					case 10: if (r.chance(0.3)) await s.ops.reload(); break;

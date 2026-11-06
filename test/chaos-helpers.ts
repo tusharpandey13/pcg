@@ -52,7 +52,7 @@ export function makeSim(o: SimOpts = {}) {
 	if (o.selectImpl) (g.ctx.ui as any).select = vi.fn(o.selectImpl);
 	const s = {
 		g, errors: [] as string[], prompts: 0, sinceUser: 0, switches: 0, concurrent: 0, unannounced: 0, seeds: [] as string[], userSent: [] as string[],
-		turn: undefined as Turn | undefined, warmCount: 0, ended: false, ctxTokens: 0, authStopped: false, refreshing: false, commandNotifyBase: 0,
+		turn: undefined as Turn | undefined, dropped: false, warmCount: 0, ended: false, ctxTokens: 0, authStopped: false, refreshing: false, commandNotifyBase: 0,
 		forcedWarmViolations: [] as string[], decisionViolations: [] as string[],
 		lastPromptRollover: false,
 	};
@@ -118,6 +118,13 @@ export function makeSim(o: SimOpts = {}) {
 			await flush();
 		},
 		async decide(action: "warm" | "stop", opts: { append?: boolean } = {}) {
+			// The previous refresh is assumed to have succeeded unless drop() lost its response. A lost
+			// response (credentials or network failed before any HTTP reply) stops warming at this decision.
+			if (s.refreshing) {
+				if (s.dropped) s.authStopped = true;
+				else await ops.status(200);
+			}
+			s.dropped = false;
 			const branchBefore = g.branch.slice();
 			const cfg = loadConfig(g.pi.getSettings());
 			const cap = breakEvenRefreshes(cfg.prices);
@@ -137,6 +144,8 @@ export function makeSim(o: SimOpts = {}) {
 			if (eff === "stop") await flush();
 			return r;
 		},
+		/** The refresh in flight never gets an HTTP response. */
+		drop() { s.dropped = true; },
 		wake(id: string, expected: boolean) { (expectWakeRaw as any)(g.pi, id, expected); if (expected) wakeSet.add(id); else wakeSet.delete(id); },
 		async status(code: number) {
 			await fire("after_provider_response", { status: code, headers: {} });
