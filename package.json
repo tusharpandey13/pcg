@@ -1,0 +1,30 @@
+{
+  "name": "pcg",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "pcg (pi cache governor): a pi extension that cuts prompt-cache costs on long Claude sessions with a short, fixed cache lifetime",
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/governor.ts"
+    ]
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "demo": "vitest run --config vitest.demo.config.ts --silent=false"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.5.0",
+    "@types/node": "^22",
+    "typescript": "^5.6",
+    "vitest": "^3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tusharpandey13/pcg.git"
+  }
+}
