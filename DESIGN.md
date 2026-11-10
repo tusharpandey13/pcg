@@ -80,6 +80,37 @@ When a run settles and the context is above the cap (default 200K tokens), the g
 
 Phase 2 starts after phase 1 has been used for real.
 
+### 7. Cost before action (proposed, not built)
+
+Every action is priced before it runs, the price is shown to the user, and the model plans with the same numbers. This replaces the fixed thresholds of features 1, 3 and 5 with one estimator.
+
+**One estimator.** `estimate(action) → { usd, low, high, breakdown }`, built from the context size, the cache state (warm until the last request plus the TTL) and the model's prices from pi (config `prices` overrides them). A request costs cached tokens × read + new or uncached tokens × write + expected output × output. A cold cache bills the whole context at the write price.
+
+**Shown before each action, on by default.**
+
+| Before | pi hook | Shown |
+|---|---|---|
+| A prompt is sent | `input` | `~$0.08 · cache warm · 1–6 requests · high $0.21` |
+| Each tool call | `tool_call` | `next step ~$0.02 (150K read + ~3K write)` |
+| Warm, checkpoint, rollover | existing paths | `warm: $0.011 now, saves ~$0.27 if you return within 30 min` |
+
+Showing never blocks. A gate is opt-in: `confirmAbove` asks before a prompt whose high estimate exceeds it, and `sessionBudget` blocks tool calls (`block` with a reason) once spent. Both default to off.
+
+**Past costs, given to the model.** The model knows the task; the governor knows the prices and history. Together they estimate better than either alone.
+
+- *History.* After each task (a prompt until the run settles), the governor appends one local record: model, requests, tokens by kind, cost, duration, tools used, and a short task label taken from the prompt. It lives in pi's user directory, never in the repository, and can be turned off.
+- *Brief.* When a prompt arrives, the governor appends a brief of about 150 tokens to the end of the context: the current price per step, the cache state, the budget left, typical and high cost for tasks of this session, and the three past tasks whose labels best match the prompt (word overlap; no embeddings, no model call).
+- *Estimate first.* A registered tool, `estimate_cost({ steps, usd, reason })`, is described as the first call for any task that will use tools. Its result is shown to the user before the first other tool runs. With a gate set, that first tool call waits for the user's confirmation.
+- *Calibration.* Each estimate is stored with the task's actual cost. The brief reports the model's recent error ("your last 10 estimates ran 1.4× low"), so its estimates correct over time.
+
+**Rules.**
+
+- The brief goes at the end of the context, never into the system prompt: changing the system prompt invalidates the cache every turn and costs more than it saves.
+- Estimates are always labelled as estimates. `/governor` reports keep using recorded usage only, and show predicted against actual cost.
+- Steps per task are decided by the model, so a task's cost is a range, not a number. The budget gate is the hard limit.
+
+**Order.** (1) estimator and predicted-vs-actual logging, nothing shown; (2) show before prompt and tool call; (3) features 1, 3 and 5 move to the estimator; (4) history, brief and `estimate_cost`; (5) gates. Each step is tested against recorded sessions and the faux provider, with no paid runs.
+
 ## Failing safe
 
 Every handler catches its own errors, logs once, and does nothing: no checkpoint, no switch, the message is delivered. Numbers read from the session (usage, costs, timestamps) are trusted only when finite and non-negative; otherwise they are unknown, dollar figures show "unknown", and decisions that need them are skipped. A corrupt checkpoint entry is ignored.
