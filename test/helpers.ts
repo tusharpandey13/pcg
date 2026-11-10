@@ -21,6 +21,7 @@ export const custom = (customType: string, data: unknown, ts = T0) => ({ type: "
 export function setup(opts: { settings?: any; branch?: any[]; hasUI?: boolean; cwd?: string; select?: string | undefined } = {}) {
 	const handlers = new Map<string, (e: any, c: any) => any>();
 	const commands = new Map<string, (a: string, c: any) => any>();
+	const tools = new Map<string, any>();
 	const bus = new Map<string, ((d: unknown) => void)[]>();
 	const sent: { text: string; opts?: any }[] = [];
 	const entries: { type: string; data: any }[] = [];
@@ -29,12 +30,13 @@ export function setup(opts: { settings?: any; branch?: any[]; hasUI?: boolean; c
 	const select = vi.fn(async (_t: string, _o: string[]) => opts.select);
 	const ui = { setStatus: vi.fn(), notify: vi.fn(), select };
 	const ctx: any = {
-		ui, hasUI: opts.hasUI ?? true, cwd: opts.cwd ?? "/nonexistent", model: { promptCache: { short: 300 } },
+		ui, hasUI: opts.hasUI ?? true, cwd: opts.cwd ?? "/nonexistent", model: { provider: "p", id: "m", promptCache: { short: 300 } },
 		isIdle: () => true, newSession,
 		sessionManager: { getBranch: () => [...branch], getSessionFile: () => "/s/old.jsonl" },
 	};
 	const pi: any = {
 		on: (ev: string, h: any) => void handlers.set(ev, h),
+		registerTool: (t: any) => void tools.set(t.name, t),
 		registerCommand: (n: string, c: any) => void commands.set(n, c.handler),
 		events: { emit: (c: string, d: unknown) => bus.get(c)?.forEach((h) => h(d)), on: (c: string, h: any) => void bus.set(c, [...(bus.get(c) ?? []), h]) },
 		sendUserMessage: (text: string, o?: any) => void sent.push({ text, opts: o }),
@@ -43,5 +45,5 @@ export function setup(opts: { settings?: any; branch?: any[]; hasUI?: boolean; c
 	};
 	governor(pi);
 	const fire = (ev: string, e: any = {}) => handlers.get(ev)!(e, ctx);
-	return { pi, ctx, fire, commands, sent, entries, branch, ui, select, newSession };
+	return { pi, ctx, fire, commands, tools, sent, entries, branch, ui, select, newSession };
 }

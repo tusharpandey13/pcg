@@ -1,8 +1,8 @@
 // Real pi AgentSession + real CacheWarmer + pi's faux provider + fake clock. No network, no cost.
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai/compat";
+import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import governor, { buildReport, DEFAULTS, expectWake } from "../src/governor.ts";
@@ -82,5 +82,31 @@ describe("with the real warmer", () => {
 		const { pi } = await boot([(p) => p.registerCommand("probe", { description: "p", handler: async () => void ran() })]);
 		pi.sendUserMessage("/probe", { expandPromptTemplates: true });
 		await vi.waitFor(() => expect(ran).toHaveBeenCalled());
+	});
+
+	it("the brief reaches the model's context after the prompt, and estimate_cost is callable and recorded", async () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "gov-int-agent-"));
+		process.env.PI_CODING_AGENT_DIR = agentDir; // never the real ~/.pi
+		const { session, faux } = await boot();
+		faux.setResponses([reply("done", { cacheWrite: 1000 }, 0.2)]);
+		await session.prompt("fix the flaky parser test");
+		await session.agent.waitForIdle();
+		let seen: any[] = [];
+		faux.setResponses([
+			(context) => { seen = context.messages as any[]; return { ...fauxAssistantMessage([fauxToolCall("estimate_cost", { steps: 4, usd: 0.5, reason: "small fix" })], { stopReason: "toolUse" }), usage: reply("", { cacheRead: 1000 }, 0.1).usage }; },
+			reply("ok", { cacheRead: 1100 }, 0.1),
+		]);
+		await session.prompt("fix the flaky parser test again");
+		await session.agent.waitForIdle();
+		const text = (m: any) => (typeof m.content === "string" ? m.content : m.content.map((c: any) => c.text ?? "").join(""));
+		const i = seen.findIndex((m) => text(m) === "fix the flaky parser test again");
+		expect(text(seen[i + 1])).toMatch(/^\[governor: cost estimates\] .*Similar past tasks: \$0\.\d+, 1 steps \("fix the flaky parser test"\)/);
+		expect(seen[i + 1].role).toBe("user");
+		expect(branch(session).some((e: any) => e.type === "custom_message" && e.customType === "governor-brief")).toBe(true); // persisted
+		const result = session.messages.find((m: any) => m.role === "toolResult") as any;
+		expect(text(result)).toMatch(/^Recorded\./);
+		const recs = readFileSync(join(agentDir, "governor-history.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+		expect(recs).toHaveLength(2);
+		expect(recs[1]).toMatchObject({ requests: 2, tools: ["estimate_cost"], estimate: { usd: 0.5, steps: 4 } });
 	});
 });
