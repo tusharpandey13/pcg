@@ -22,7 +22,7 @@ export interface GovernorConfig {
 	prices: Prices;
 }
 export const DEFAULTS: GovernorConfig = {
-	checkpointMinTokens: 100_000,
+	checkpointMinTokens: 0, // an optional floor: checkpointPays decides
 	rolloverTokens: 200_000,
 	askOnReturn: true,
 	prices: { input: 2, cacheWrite: 2.5, cacheRead: 0.2, output: 10 }, // Sonnet 5.5 first-party, $/MTok
@@ -45,9 +45,38 @@ export function loadConfig(settings: unknown): GovernorConfig {
 	};
 }
 
+/** What a new or rewritten token costs: the cache-write price, or input for a model without one (cacheWrite 0). */
+const writePriceOf = (p: Prices) => (p.cacheWrite > 0 ? p.cacheWrite : p.input);
+
 /** Refreshes whose total cost equals one rewrite: (write - read) / read. */
 export function breakEvenRefreshes(p: Prices): number {
-	return p.cacheRead > 0 ? Math.floor((p.cacheWrite - p.cacheRead) / p.cacheRead) : 0;
+	return p.cacheRead > 0 ? Math.max(0, Math.floor((writePriceOf(p) - p.cacheRead) / p.cacheRead)) : 0;
+}
+
+// Chance the user returns before the next refresh (about one cache lifetime x 0.9), given they are still away.
+// Fitted to measured return rates on the maintainer's sessions: about 34% at 5-9.5 minutes away, falling to
+// about 8% at 30 minutes. Break-even for a refresh at Bedrock Sonnet prices is about 4%.
+export const RETURN_H0 = 0.53;
+export const RETURN_TAU_MIN = 16;
+export function returnChance(minutesAway: number): number {
+	const m = Number.isFinite(minutesAway) && minutesAway > 0 ? minutesAway : 0;
+	return RETURN_H0 * Math.exp(-m / RETURN_TAU_MIN);
+}
+
+/** Share of checkpoints assumed to be used on return. A prior, not measured. */
+export const CHECKPOINT_USE_CHANCE = 0.25;
+/** Output tokens of a checkpoint: a handoff of under 300 words (~400 tokens), written once and echoed in the reply, plus the tool call. */
+export const CHECKPOINT_OUTPUT_TOKENS = 1000;
+/**
+ * A checkpoint pays when its expected saving covers its cost. Cost: two requests that read the context
+ * (write the handoff, reply) plus the output. Saving: the rewrite avoided minus seeding the handoff into the new session.
+ */
+export function checkpointPays(tokens: number, p: Prices): boolean {
+	const t = fin(tokens);
+	if (t === undefined) return false;
+	const cost = (2 * t * p.cacheRead + CHECKPOINT_OUTPUT_TOKENS * p.output) / 1e6;
+	const saving = (Math.max(0, t - CHECKPOINT_OUTPUT_TOKENS) * writePriceOf(p)) / 1e6;
+	return CHECKPOINT_USE_CHANCE * saving >= cost;
 }
 
 // ---- wake signal (phase 2 plugs in here) -----------------------------------
@@ -110,9 +139,10 @@ export interface Report {
 	net: number;
 }
 /** Every figure comes from usage pi recorded (cache_warm entries, assistant usage) plus governor entries. */
-export function buildReport(branch: Entry[], cfg: GovernorConfig, ttlMs: number): Report {
+export function buildReport(branch: Entry[], cfg: GovernorConfig, ttlMs: number, prices: Prices = cfg.prices): Report {
 	const r: Report = { refreshes: 0, refreshCost: 0, checkpoints: 0, checkpointCost: 0, rollovers: 0, continues: 0, rewritesAvoided: 0, saved: 0, net: 0 };
-	const { cacheWrite, cacheRead } = cfg.prices;
+	const { cacheRead } = prices;
+	const cacheWrite = writePriceOf(prices);
 	let prev: number | undefined;
 	for (const e of branch) {
 		if (isWarm(e) && e.type === "usage") {
@@ -367,18 +397,31 @@ export default function governor(pi: ExtensionAPI) {
 		// Time left before pi's 30-minute idle stop: the next refresh would be the last one.
 		const final = last !== undefined && Date.now() + ttlOf(ctx) * 0.9 > last.ts + IDLE_LIMIT;
 		const forced = wakes.size > 0;
-		const spent = Math.max(warmCount, refreshesSince(branch)) >= breakEvenRefreshes(cfg.prices);
-		const canCheckpoint = !checkpoint && !attempted && phase === "idle" && ctx.isIdle() && last !== undefined && last.tokens >= cfg.checkpointMinTokens;
+		const prices = pricesOf(ctx.model, cfg.prices);
+		const spent = Math.max(warmCount, refreshesSince(branch)) >= breakEvenRefreshes(prices);
+		const canCheckpoint =
+			!checkpoint && !attempted && phase === "idle" && ctx.isIdle() && last !== undefined && last.tokens >= cfg.checkpointMinTokens && checkpointPays(last.tokens, prices);
+		// Without a wake, warm when the chance the user returns before the next refresh pays for it; pi's own action when that is unknown.
+		const [warmCost, missCost] = [fin(ev.warmCost), fin(ev.missCost)];
+		const priced = last !== undefined && warmCost !== undefined && missCost !== undefined && missCost > 0;
+		const want = priced ? returnChance((Date.now() - last.ts) / MIN) * missCost >= warmCost : ev.action === "warm";
 		// The last slot before pi's idle stop goes to the checkpoint when one will be taken; otherwise it is a normal refresh.
-		const warm = forced ? !spent && !ended : !checkpoint && ev.action === "warm" && !(final && canCheckpoint);
+		const warm = forced ? !spent && !ended : !checkpoint && want && !(final && canCheckpoint);
 		// Checkpoint before warming ends: at pi's idle stop (even if a wake still holds warming), at the cap, or when pi stops.
-		if ((final || !warm) && canCheckpoint) startCheckpoint(ctx, false);
+		const checkpointing = (final || !warm) && canCheckpoint;
+		if (checkpointing) startCheckpoint(ctx, false);
 		if (forced && (final || spent)) ended = true; // warming ends here; a restarted run after the checkpoint must not warm on
-		if (!warm) return { action: "stop" };
+		// Display only: never changes the decision.
+		if (!checkpointing && warmCost !== undefined && missCost !== undefined) {
+			const touch = lastTouch(branch);
+			if (warm) showCost(ctx, `warming ~${usd(warmCost)} per refresh \u00b7 a rewrite would cost ~${usd(missCost)}`);
+			else if (touch !== undefined)
+				showCost(ctx, `cache expires ~${new Date(touch + ttlOf(ctx)).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false })} \u00b7 returning later costs ~${usd(missCost)} (rewrite)`);
+		}
+		if (!warm) return forced || ev.action !== "stop" ? { action: "stop" } : undefined;
 		refreshing = true;
-		if (!forced) return;
-		warmCount++;
-		return { action: "warm" };
+		if (forced) warmCount++;
+		return forced || ev.action !== "warm" ? { action: "warm" } : undefined;
 	});
 
 	// Feature 2: a refresh gets its response through the same hook as real requests.
@@ -495,7 +538,7 @@ export default function governor(pi: ExtensionAPI) {
 			const awt = hasAwt(ctx.cwd);
 			const text = (!awt && readHandoff(ctx)) || textOf(last);
 			checkpoint = { text, tokens: tokensOf(last) ?? 0, awt };
-			pi.appendEntry("governor-checkpoint", { ...checkpoint, open: true, rollover: wasRollover, cost: fin(last.usage?.cost?.total) ?? 0 });
+			pi.appendEntry("governor-checkpoint", { ...checkpoint, open: true, rollover: wasRollover, cost: branch.slice(cpFrom).reduce((sum, e) => sum + (fin(asMsg(e)?.usage?.cost?.total) ?? 0), 0) });
 			if (wasRollover) later(() => runCommand("governor-rollover"));
 			else release();
 			return;
@@ -520,9 +563,9 @@ export default function governor(pi: ExtensionAPI) {
 		const touch = lastTouch(branch);
 		const last = lastRequest(branch);
 		if (touch === undefined || !last || Date.now() - touch <= ttlOf(ctx)) return closeCheckpoint();
-		const p = cfg.prices;
-		const resumeCost = (last.tokens * p.cacheWrite) / 1e6;
-		const continueCost = ((checkpoint.text.length + ev.text.length) / 4) * p.cacheWrite / 1e6;
+		const writePrice = writePriceOf(pricesOf(ctx.model, cfg.prices));
+		const resumeCost = (last.tokens * writePrice) / 1e6;
+		const continueCost = (((checkpoint.text.length + ev.text.length) / 4) * writePrice) / 1e6;
 		let choice = remember;
 		if (!choice && cfg.askOnReturn && ctx.hasUI) {
 			const ago = Math.round((Date.now() - touch - ttlOf(ctx)) / MIN);
@@ -583,9 +626,21 @@ export default function governor(pi: ExtensionAPI) {
 	};
 	pi.registerCommand("governor-rollover", {
 		description: "Internal: start a fresh session from the checkpoint",
-		handler: guard("governor-rollover", (_a: string, ctx: CmdCtx) =>
-			freshSession(ctx, `Context passed ${k(cfg.rolloverTokens)} tokens; continuing in a fresh session from the checkpoint.`, held.splice(0).join("\n\n") || undefined),
-		) as never,
+		handler: guard("governor-rollover", (_a: string, ctx: CmdCtx) => {
+			// Per-step read cost before and after: the context now against the handoff alone.
+			const read = pricesOf(ctx.model, cfg.prices).cacheRead;
+			// A fresh session carries the system prompt and tools too: approximated by this session's first request.
+			const branch: Entry[] = ctx.sessionManager.getBranch();
+			const first = branch.map(asMsg).find((m): m is Msg => !!m);
+			const base = first && tokensOf(first);
+			const [tokens, handoff] = [lastRequest(branch)?.tokens, checkpoint?.text.length];
+			const step = (n: number | undefined) => (n === undefined ? "unknown" : usd((n * read) / 1e6));
+			return freshSession(
+				ctx,
+				`Context passed ${k(cfg.rolloverTokens)} tokens (~${step(tokens)} per step); continuing in a fresh session from the checkpoint (~${step(handoff === undefined || base === undefined || tokens === undefined ? undefined : Math.min(base, tokens) + handoff / 4)} per step).`,
+				held.splice(0).join("\n\n") || undefined,
+			);
+		}) as never,
 	});
 	pi.registerCommand("governor-continue", {
 		description: "Internal: continue your message in a fresh session from the checkpoint",
@@ -600,16 +655,17 @@ export default function governor(pi: ExtensionAPI) {
 	pi.registerCommand("governor", {
 		description: "Show prompt-cache savings for this session and the governor settings",
 		handler: guard("governor", async (_a: string, ctx: CmdCtx) => {
-			const r = buildReport(ctx.sessionManager.getBranch(), cfg, ttlOf(ctx));
-			const es = estimateStats(ctx.sessionManager.getBranch());
 			const p = cfg.prices;
+			const mp = pricesOf(ctx.model, cfg.prices);
+			const r = buildReport(ctx.sessionManager.getBranch(), cfg, ttlOf(ctx), mp);
+			const es = estimateStats(ctx.sessionManager.getBranch());
 			ctx.ui.notify(
 				[
-					`Refreshes: ${r.refreshes} (${usd(r.refreshCost)})   break-even cap: ${breakEvenRefreshes(p)}`,
+					`Refreshes: ${r.refreshes} (${usd(r.refreshCost)})   break-even cap: ${breakEvenRefreshes(mp)}`,
 					`Checkpoints: ${r.checkpoints} (${usd(r.checkpointCost)})   rollovers: ${r.rollovers}   continued from checkpoint: ${r.continues}`,
 					`Rewrites avoided: ${r.rewritesAvoided}   saved: ${usd(r.saved)}   net: ${usd(r.net)}`,
 						es ? `Estimates: ${es.n} paired   predicted/actual median ${es.median.toFixed(2)}x   worst ${es.worst.toFixed(2)}x` : "Estimates: no estimates yet",
-					`Config: checkpoint>=${k(cfg.checkpointMinTokens)} rollover>${cfg.rolloverTokens ? k(cfg.rolloverTokens) : "off"} ask=${cfg.askOnReturn} prices(in/write/read/out)=${p.input}/${p.cacheWrite}/${p.cacheRead}/${p.output}` +
+					`Config: checkpoint floor=${k(cfg.checkpointMinTokens)} rollover>${cfg.rolloverTokens ? k(cfg.rolloverTokens) : "off"} ask=${cfg.askOnReturn} prices(in/write/read/out)=${p.input}/${p.cacheWrite}/${p.cacheRead}/${p.output}` +
 						(wakes.size ? `   wakes expected: ${wakes.size}` : "") +
 						(authExpired ? "   warming stopped: AWS credentials expired or unavailable" : ""),
 				].join("\n"),

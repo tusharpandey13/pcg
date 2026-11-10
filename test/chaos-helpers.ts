@@ -129,7 +129,7 @@ export function makeSim(o: SimOpts = {}) {
 			const cfg = loadConfig(g.pi.getSettings());
 			const cap = breakEvenRefreshes(cfg.prices);
 			const wakesNow = wakeSet.size > 0;
-			const r = await fire("cache_warming_decision", { type: "cache_warming_decision", action, warmCost: 0.05, missCost: 0.5, continuationProbability: 0.15 });
+			const r = await fire("cache_warming_decision", { type: "cache_warming_decision", action, continuationProbability: 0.15 });
 			const eff = r?.action ?? action;
 			if (wakesNow) {
 				const last = lastRequest(branchBefore as never);

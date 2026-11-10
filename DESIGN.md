@@ -14,13 +14,17 @@ The governor does not replace it. It adds what the warmer cannot know, and handl
 
 ## Features
 
-### 1. Warm when a wake is certain
+### 1. Warm by the return curve, and when a wake is certain
 
-The warmer assumes a 15% chance that a request arrives. When the governor knows a request will arrive, because a worker it started is still running and will report to this session, it overrides the decision to `warm` until the worker reports or the break-even cap is reached.
+The warmer assumes a 15% chance that a request arrives, whatever the time away or the context size. The governor replaces that with a measured return curve. At every refresh tick pi reports `warmCost` (a cache read of the prompt plus one output token) and `missCost` (a full miss minus a hit), both at the model's catalog prices. When no wake is expected, the governor warms if and only if `returnChance(minutes away) * missCost >= warmCost`, and overrides pi in either direction: it warms small contexts pi skips, and stops late refreshes pi would send. It returns pi's action (no override) when the two agree.
+
+`returnChance(m) = 0.53 * exp(-m / 16)` is the chance the user returns before the next refresh (about one cache lifetime x 0.9), given they are still away. It is fitted to measured return rates on the maintainer's sessions: about 34% at 5-9.5 minutes away, falling to about 8% at 30 minutes. Break-even for a refresh at Bedrock Sonnet prices is about 4%. It has no setting. If either cost is unknown, `missCost` is 0, or the last request is unknown, the governor follows pi's action. The stops below, the open checkpoint and the final-slot checkpoint rule all win over the curve.
+
+When the governor knows a request will arrive, because a worker it started is still running and will report to this session, it overrides the decision to `warm` until the worker reports or the break-even cap is reached.
 
 Cap: the smaller of two limits.
 
-- Break-even: refreshes equal to one rewrite, `(write - read) / read`, about 11 for Sonnet 5.5 (about 50 minutes). After that, letting the cache expire is cheaper.
+- Break-even: refreshes equal to one rewrite, `(write - read) / read`, about 11 for Sonnet 5.5 (about 50 minutes). It uses the model's prices, and input as the write price when the model has none. After that, letting the cache expire is cheaper.
 - pi's idle limit: pi caps idle warming at 30 minutes after the request that started the run, about 6 refreshes at a 5-minute lifetime. A wake longer than that ends in a checkpoint, not in warming.
 
 Refreshes are counted by warm decisions, so a failed refresh (500, 429, timeout), which leaves no `cache_warm` entry, still counts. When the cap or the idle limit is reached while a wake is still expected, the governor checkpoints before warming ends, as in feature 3, and does not restart warming for that idle period.
@@ -40,12 +44,20 @@ Neither case writes a checkpoint, because a checkpoint needs a working connectio
 
 ### 3. Checkpoint while warm
 
-When warming is about to stop and the context is large (default 100K tokens or more), the governor writes a handoff while the cache is still warm. It does this as a turn inside the session, so the turn reads the cached context at 0.1x and writes a short handoff, typically 1-3K output tokens.
+When warming is about to stop and a checkpoint pays for itself, the governor writes a handoff while the cache is still warm.
+
+A checkpoint pays when `CHECKPOINT_USE_CHANCE * saving >= cost`, with prices from the model:
+
+- cost = `2 * tokens * cacheRead + 1000 * output`: two requests (write the handoff, reply) that read the context, plus about 1000 output tokens (a handoff under 300 words, written and echoed, plus the tool call).
+- saving = `(tokens - 1000) * writePrice`: the rewrite avoided, minus seeding the handoff into the new session. `writePrice` is the cache-write price, or input when the model has none.
+- `CHECKPOINT_USE_CHANCE = 0.25` is a prior, not measured.
+
+At Bedrock Sonnet prices (input 3, write 3.75, read 0.3, output 15) this crosses at about 47K tokens. `checkpointMinTokens` is an optional floor on top (default 0): the economics decide. The recorded cost of a checkpoint is the sum of all its requests, so the constants can be checked against real checkpoints. It does this as a turn inside the session, so the turn reads the cached context at 0.1x and writes a short handoff, typically 1-3K output tokens.
 
 - With `./awt` in the task directory, the turn runs `./awt state --now ... --next ...` and updates refs and decisions as needed.
 - Without it, the turn writes `.pi-governor/handoff.md`.
 
-A checkpoint costs about 0.1x the context plus output. That is worth paying only when the cache will probably expire before you return, which is exactly when warming stops.
+A checkpoint costs about 0.2x the context plus output (two reads). That is worth paying only when the cache will probably expire before you return, which is exactly when warming stops.
 
 The checkpoint takes the slot of the last refresh before pi's 30-minute idle stop (the governor acts at 29 minutes). When no checkpoint will be taken, for example because the context is under the threshold or one was already attempted, that last refresh is sent as usual.
 
@@ -71,6 +83,8 @@ Cache expired 23 min ago. Context: 342K tokens.
 
 When a run settles and the context is above the cap (default 200K tokens), the governor does the same in-session handoff while warm, then starts a fresh session from it, and tells you. This bounds the cost of every later turn and of any later rewrite. The cap is configurable, and `0` turns rollover off.
 
+The cap stays a size, not a price. Cost alone says to roll over almost at once, because a smaller context always costs less per step; the real limit is summary quality, which the estimator cannot price. The notice shows what the move buys, as the read cost per step before and after: `Context passed 200K tokens (~$0.06 per step); continuing in a fresh session from the checkpoint (~$0.01 per step).` Before is the last context size x cacheRead; after is this session's first request (system prompt, tools, first prompt) plus the handoff length / 4, x cacheRead, at the model's prices.
+
 ### 6. Workers with a mailbox (phase 2)
 
 - A tool lets the front agent start a worker: a separate pi process in RPC mode with its own fresh context. When `./awt` exists, the worker starts from `./awt resume --scope <id>`.
@@ -80,7 +94,7 @@ When a run settles and the context is above the cap (default 200K tokens), the g
 
 Phase 2 starts after phase 1 has been used for real.
 
-### 7. Cost before action (step 1 built; the rest proposed)
+### 7. Cost before action (steps 1 to 3 built; the rest proposed)
 
 Every action is priced before it runs, the price is shown to the user, and the model plans with the same numbers. This replaces the fixed thresholds of features 1, 3 and 5 with one estimator.
 
@@ -92,7 +106,7 @@ Every action is priced before it runs, the price is shown to the user, and the m
 |---|---|---|
 | A prompt is sent | `input` | `~$0.08 · cache warm · 1–6 requests · high $0.21` |
 | Each tool call | `tool_call` | `next step ~$0.02 (150K read + ~3K write)` |
-| Warm, checkpoint, rollover | existing paths | `warm: $0.011 now, saves ~$0.27 if you return within 30 min` |
+| Warm or stop while idle | `cache_warming_decision` | warm: `warming ~$0.03 per refresh · a rewrite would cost ~$0.35`; stop (no checkpoint starting): `cache expires ~14:05 · returning later costs ~$0.35 (rewrite)` |
 
 Showing never blocks. A gate is opt-in: `confirmAbove` asks before a prompt whose high estimate exceeds it, and `sessionBudget` blocks tool calls (`block` with a reason) once spent. Both default to off.
 
@@ -109,7 +123,7 @@ Showing never blocks. A gate is opt-in: `confirmAbove` asks before a prompt whos
 - Estimates are always labelled as estimates. `/governor` reports keep using recorded usage only, and show predicted against actual cost.
 - Steps per task are decided by the model, so a task's cost is a range, not a number. The budget gate is the hard limit.
 
-**Order.** (1) estimator and predicted-vs-actual logging, nothing shown (**built**: `estimateRequest` prices each real request at the model's catalog prices from pi (`prices` only when the model has none; a model without a cache-write price bills new tokens at input) in `before_provider_request`, with input size approximated as payload characters / 4 because exact tokens are unknown before the call; cache-warming refreshes are skipped; `message_end` pairs the prediction with the usage pi recorded and appends a `governor-estimate` entry; `/governor` shows the paired count and the median and worst predicted/actual ratio; `npm run calibrate -- <session.jsonl>` replays the estimator over a recorded session, offline, at the prices recorded in it; it assumes a 5-minute cache lifetime, so providers that keep caches longer show outliers); (2) show before prompt and tool call (**built**: the `input` hook prices the prompt's first request with `estimateRequest` (cold if the cache expired) and adds one warm follow-up step per further request, since only the first request can pay a rewrite; the request count is this session's requests per turn, the assistant messages between consecutive user messages on the branch, over the last 10 turns: the median gives the typical figure and the min and max give the range and the high figure, with "1+ requests" until two turns exist; the `tool_call` hook prices the request the tool result triggers, as a warm read of the current context plus the median of recent per-request prompt growth, or 3000 tokens before any history; both write the `governor-cost` status, extension-sent inputs are ignored, a cold cache shows as "cache cold (rewrite)", the status is cleared when the run settles, and unknown inputs show nothing; it never blocks or changes anything); (3) features 1, 3 and 5 move to the estimator; (4) history, brief and `estimate_cost`; (5) gates. Each step is tested against recorded sessions and the faux provider, with no paid runs.
+**Order.** (1) estimator and predicted-vs-actual logging, nothing shown (**built**: `estimateRequest` prices each real request at the model's catalog prices from pi (`prices` only when the model has none; a model without a cache-write price bills new tokens at input) in `before_provider_request`, with input size approximated as payload characters / 4 because exact tokens are unknown before the call; cache-warming refreshes are skipped; `message_end` pairs the prediction with the usage pi recorded and appends a `governor-estimate` entry; `/governor` shows the paired count and the median and worst predicted/actual ratio; `npm run calibrate -- <session.jsonl>` replays the estimator over a recorded session, offline, at the prices recorded in it; it assumes a 5-minute cache lifetime, so providers that keep caches longer show outliers); (2) show before prompt and tool call (**built**: the `input` hook prices the prompt's first request with `estimateRequest` (cold if the cache expired) and adds one warm follow-up step per further request, since only the first request can pay a rewrite; the request count is this session's requests per turn, the assistant messages between consecutive user messages on the branch, over the last 10 turns: the median gives the typical figure and the min and max give the range and the high figure, with "1+ requests" until two turns exist; the `tool_call` hook prices the request the tool result triggers, as a warm read of the current context plus the median of recent per-request prompt growth, or 3000 tokens before any history; both write the `governor-cost` status, extension-sent inputs are ignored, a cold cache shows as "cache cold (rewrite)", the status is cleared when the run settles, and unknown inputs show nothing; it never blocks or changes anything); (3) features 1, 3 and 5 move to the estimator (**built**: warming follows the return curve of feature 1 and overrides pi both ways; a checkpoint needs `checkpointPays` (feature 3), so `checkpointMinTokens` defaults to 0 and is only a floor; rollover keeps its size cap and its notice shows the per-step read cost before and after (feature 5); the idle status above uses `showCost`, is display only and never changes a decision, and the next prompt overwrites it; the break-even cap, the return prompt and `/governor` reports use the model's prices from pi, with input as the write price when the model has none, and `/governor` still prints the configured `prices`); (4) history, brief and `estimate_cost`; (5) gates. Each step is tested against recorded sessions and the faux provider, with no paid runs.
 
 ## Failing safe
 
@@ -121,7 +135,7 @@ All settings live in one block in pi's settings, with these defaults:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `checkpointMinTokens` | 100000 | Smallest context worth a checkpoint |
+| `checkpointMinTokens` | 0 | Optional floor on the context size for a checkpoint; the economic rule decides otherwise |
 | `rolloverTokens` | 200000 | Context size that triggers a rollover; 0 is off |
 | `askOnReturn` | true | Ask between resuming and continuing from the checkpoint |
 | `prices` | Sonnet 5.5 first-party | $ per million tokens: input, cache write, cache read, output. Set to your Bedrock rates |

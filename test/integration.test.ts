@@ -54,23 +54,27 @@ describe("with the real warmer", () => {
 		expect(userTexts(session)).toEqual([BIG]); // refreshes stay out of the conversation
 	});
 
-	it("without a wake, pi stops and the governor runs a checkpoint turn inside the session, once", async () => {
+	it("without a wake, the return curve keeps warming small refreshes, then the governor checkpoints on the last slot, once", async () => {
 		const { session, faux } = await boot();
 		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
 		faux.setResponses([reply("hi", { cacheWrite: 150_000 })]);
 		await session.prompt(BIG);
-		faux.setResponses([reply("handoff written", { cacheRead: 150_000 })]);
+		// pi alone would stop (0.15 * $0.52 - $0.05 < $0.05); the curve warms: 0.4 * $0.52 > $0.05.
+		faux.setResponses(Array.from({ length: 12 }, () => reply("handoff written", { cacheRead: 150_000 }, 0.0456)));
 		await vi.advanceTimersByTimeAsync(4.5 * 60_000 + 50);
-		await vi.advanceTimersByTimeAsync(1000);
+		await session.agent.waitForIdle();
+		expect(branch(session).filter((e: any) => e.type === "usage" && e.kind === "cache_warm")).toHaveLength(1);
+		expect(userTexts(session)).toHaveLength(1);
+		for (let i = 0; i < 6; i++) await vi.advanceTimersByTimeAsync(4.5 * 60_000);
 		await session.agent.waitForIdle();
 		const users = userTexts(session);
 		expect(users).toHaveLength(2);
 		expect(users[1]).toContain("[governor checkpoint]");
 		expect(branch(session).filter((e: any) => e.type === "custom" && e.customType === "governor-checkpoint" && e.data.open)).toHaveLength(1);
-		faux.setResponses([reply("unexpected", {})]);
+		const pending = faux.getPendingResponseCount();
 		await vi.advanceTimersByTimeAsync(20 * 60_000);
 		expect(userTexts(session)).toHaveLength(2); // no loop, no further request
-		expect(faux.getPendingResponseCount()).toBe(1);
+		expect(faux.getPendingResponseCount()).toBe(pending);
 	});
 
 	it("sendUserMessage('/cmd', { expandPromptTemplates }) dispatches an extension command (used for rollover/continue)", async () => {

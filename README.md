@@ -15,11 +15,12 @@ pi already has a cache warmer that refreshes the cache before it expires, but it
 | Situation | What pcg does |
 |---|---|
 | You send a prompt, or the model is about to run a tool | Shows an estimate in the status line, never blocking: `~$0.08 · cache warm · 1–6 requests · high $0.21` (a cold cache shows `cache cold (rewrite)`), then `next step ~$0.02 (150K read + ~3K write)` before each tool call. Estimates are rough, and cleared when the run ends |
+| You are away and a refresh is due | Decides by how likely you are to return before the next refresh (about 34% after 5–10 minutes, 8% after 30), against the refresh cost and the rewrite it would avoid. It can warm what pi would skip and stop what pi would warm. Shows `warming ~$0.03 per refresh · a rewrite would cost ~$0.35`, or when warming stops, `cache expires ~14:05 · returning later costs ~$0.35 (rewrite)` |
 | A wake is certain, such as a worker still running that will report back | Keeps warming until the wake arrives, up to the break-even point or pi's 30-minute idle limit |
 | Credentials expired: a refresh gets a 401 or 403, or gets no response at all (for example a credential helper waiting on MFA) | Stops warming instead of retrying every 4.5 minutes, and shows "AWS credentials expired" or "AWS credentials unavailable". The next real request recovers. |
-| Warming is about to stop and the context is large | Writes a **checkpoint** as a turn inside the session while the cache is warm, at about 0.1× the context |
+| Warming is about to stop and a checkpoint pays for itself (about 47K tokens or more at Bedrock Sonnet prices) | Writes a **checkpoint** as a turn inside the session while the cache is warm, at about 0.1× the context |
 | You return after the cache expired and a checkpoint exists | Asks once: resume the full context, or continue from the checkpoint in a fresh session, with dollar estimates for each |
-| The context passes a size cap (200K tokens by default) | Hands off while warm, rolls over to a fresh session, and tells you |
+| The context passes a size cap (200K tokens by default) | Hands off while warm, rolls over to a fresh session, and tells you the per-step read cost before and after |
 
 A checkpoint is always a turn inside the warm session. A handoff written by a separate request would read the whole context at the full input price, which is the cost this extension exists to avoid.
 
@@ -73,7 +74,7 @@ pi loads TypeScript directly, so there is no build step, and pcg has no runtime 
    ```json
    {
      "governor": {
-       "checkpointMinTokens": 100000,
+       "checkpointMinTokens": 0,
        "rolloverTokens": 200000,
        "askOnReturn": true,
        "prices": { "input": 2, "cacheWrite": 2.5, "cacheRead": 0.2, "output": 10 }
