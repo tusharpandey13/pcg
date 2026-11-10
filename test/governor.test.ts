@@ -2,7 +2,7 @@ import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { breakEvenRefreshes, buildReport, DEFAULTS, expectWake, loadConfig } from "../src/governor.ts";
+import { breakEvenRefreshes, buildReport, DEFAULTS, economicWarm, expectWake, hasOwnEconomics, loadConfig } from "../src/governor.ts";
 import { assistant, custom, setup, T0, warm } from "./helpers.ts";
 
 const MIN = 60_000;
@@ -10,6 +10,8 @@ beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(T0 + 4.5 * MIN); });
 afterEach(() => vi.useRealTimers());
 const dec = (action: "warm" | "stop") => ({ type: "cache_warming_decision", action, warmCost: 0.05, missCost: 0.5, continuationProbability: 0.15 });
 const big = (n = 150_000) => [assistant(T0, n)];
+/** A decision with explicit costs: miss 0.2, refresh 0.01, so savings are p * 0.2 - 0.01. */
+const decCost = (action: "warm" | "stop", over: Record<string, number> = {}) => ({ type: "cache_warming_decision", action, warmCost: 0.01, missCost: 0.2, continuationProbability: 0.15, ...over });
 
 describe("config", () => {
 	it("derives break-even from prices, not a constant", () => {
@@ -61,6 +63,84 @@ describe("feature 1: wake-aware warming", () => {
 		await g.fire("after_provider_response", { status: 200, headers: {} });
 		expectWake(g.pi, "w2", false);
 		expect(await g.fire("cache_warming_decision", dec("warm"))).toBeUndefined();
+	});
+});
+
+describe("feature 1b: the governor's own warming economics", () => {
+	const own = (governor: object) => ({ governor: { prices: { input: 3, cacheWrite: 3.75, cacheRead: 0.3, output: 15 }, ...governor } });
+	it("config: both knobs default to pi's behaviour and junk is ignored", () => {
+		expect(hasOwnEconomics(loadConfig({}))).toBe(false);
+		expect(loadConfig({ governor: { continuationProbability: 1.5, minSavings: -1 } })).toMatchObject({ continuationProbability: undefined, minSavings: 0.05 });
+		expect(loadConfig({ governor: { continuationProbability: 0.4, minSavings: 0.02 } })).toMatchObject({ continuationProbability: 0.4, minSavings: 0.02 });
+		expect(hasOwnEconomics(loadConfig({ governor: { minSavings: 0.02 } }))).toBe(true);
+		expect(hasOwnEconomics(loadConfig({ governor: { continuationProbability: 0.4 } }))).toBe(true);
+	});
+	it("economicWarm replaces only the idle probability, and falls back to pi when economics are unknown", () => {
+		const cfg = loadConfig({ governor: { continuationProbability: 0.5 } });
+		expect(economicWarm(decCost("stop"), cfg)).toBe(true); // 0.5 * 0.2 - 0.01 = 0.09 >= 0.05
+		expect(economicWarm(decCost("warm", { continuationProbability: 1 }), cfg)).toBe(true); // streaming keeps pi's 1.0
+		expect(economicWarm(decCost("stop", { missCost: 0.05 }), cfg)).toBe(false); // 0.5 * 0.05 - 0.01 = 0.015
+		expect(economicWarm(decCost("stop", { missCost: 0 }), cfg)).toBe(false); // unknown: pi's action
+		expect(economicWarm(decCost("warm", { missCost: 0 }), cfg)).toBe(true);
+		expect(economicWarm(decCost("warm", { warmCost: NaN }), cfg)).toBe(true);
+	});
+	it("warms where pi stops once the configured probability clears the floor", async () => {
+		const g = setup({ settings: own({ continuationProbability: 0.5 }), branch: big() });
+		g.fire("session_start");
+		expect(await g.fire("cache_warming_decision", decCost("stop"))).toEqual({ action: "warm" });
+	});
+	it("a lower floor alone can start warming", async () => {
+		const g = setup({ settings: own({ minSavings: 0.01 }), branch: big() });
+		g.fire("session_start");
+		expect(await g.fire("cache_warming_decision", decCost("stop"))).toEqual({ action: "warm" }); // 0.15 * 0.2 - 0.01 = 0.02
+	});
+	it("a higher floor can stop what pi would warm", async () => {
+		const g = setup({ settings: own({ minSavings: 0.5 }), branch: big() });
+		g.fire("session_start");
+		expect(await g.fire("cache_warming_decision", decCost("warm"))).toEqual({ action: "stop" });
+	});
+	it("stops when the expected saving stays below the floor", async () => {
+		const g = setup({ settings: own({ continuationProbability: 0.1 }), branch: big() });
+		g.fire("session_start");
+		expect(await g.fire("cache_warming_decision", decCost("stop"))).toEqual({ action: "stop" }); // 0.1 * 0.2 - 0.01 = 0.01
+	});
+	it("ends at the break-even cap, counting refreshes it allowed", async () => {
+		const g = setup({ settings: own({ continuationProbability: 0.5 }), branch: big() });
+		g.fire("session_start");
+		for (let i = 0; i < 11; i++) {
+			expect(await g.fire("cache_warming_decision", decCost("stop"))).toEqual({ action: "warm" });
+			await g.fire("after_provider_response", { status: 200, headers: {} }); // the refresh got a response
+		}
+		expect(await g.fire("cache_warming_decision", decCost("stop"))).toEqual({ action: "stop" });
+	});
+	it("a real request resets the refresh count", async () => {
+		const g = setup({ settings: own({ continuationProbability: 0.5 }), branch: big() });
+		g.fire("session_start");
+		for (let i = 0; i < 11; i++) {
+			await g.fire("cache_warming_decision", decCost("stop"));
+			await g.fire("after_provider_response", { status: 200, headers: {} });
+		}
+		g.fire("agent_start");
+		expect(await g.fire("cache_warming_decision", decCost("stop"))).toEqual({ action: "warm" });
+	});
+	it("still checkpoints when it stops warming a large context", async () => {
+		const g = setup({ settings: own({ continuationProbability: 0.1 }), branch: big() });
+		g.fire("session_start");
+		await g.fire("cache_warming_decision", decCost("stop"));
+		expect(g.sent.length).toBe(1); // checkpoint turn, same as when pi stops
+	});
+	it("never warms after an auth failure", async () => {
+		const g = setup({ settings: own({ continuationProbability: 0.9 }), branch: big() });
+		g.fire("session_start");
+		await g.fire("cache_warming_decision", decCost("stop"));
+		await g.fire("after_provider_response", { status: 403, headers: {} });
+		expect(await g.fire("cache_warming_decision", decCost("stop"))).toEqual({ action: "stop" });
+	});
+	it("a wake still forces warming regardless of the floor", async () => {
+		const g = setup({ settings: own({ minSavings: 5 }), branch: big() });
+		g.fire("session_start");
+		expectWake(g.pi, "w");
+		expect(await g.fire("cache_warming_decision", decCost("stop"))).toEqual({ action: "warm" });
 	});
 });
 

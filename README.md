@@ -15,6 +15,7 @@ pi already has a cache warmer that refreshes the cache before it expires, but it
 | Situation | What pcg does |
 |---|---|
 | A wake is certain, such as a worker still running that will report back | Keeps warming until the wake arrives, up to the break-even point or pi's 30-minute idle limit |
+| You set `continuationProbability` or `minSavings` | Judges each refresh with your numbers instead of pi's fixed 15% chance and $0.05 floor, so mid-sized contexts get warmed too |
 | Credentials expired: a refresh gets a 401 or 403, or gets no response at all (for example a credential helper waiting on MFA) | Stops warming instead of retrying every 4.5 minutes, and shows "AWS credentials expired" or "AWS credentials unavailable". The next real request recovers. |
 | Warming is about to stop and the context is large | Writes a **checkpoint** as a turn inside the session while the cache is warm, at about 0.1× the context |
 | You return after the cache expired and a checkpoint exists | Asks once: resume the full context, or continue from the checkpoint in a fresh session, with dollar estimates for each |
@@ -75,12 +76,15 @@ pi loads TypeScript directly, so there is no build step, and pcg has no runtime 
        "checkpointMinTokens": 100000,
        "rolloverTokens": 200000,
        "askOnReturn": true,
-       "prices": { "input": 2, "cacheWrite": 2.5, "cacheRead": 0.2, "output": 10 }
+       "prices": { "input": 2, "cacheWrite": 2.5, "cacheRead": 0.2, "output": 10 },
+       "minSavings": 0.05
      }
    }
    ```
-   - `prices` are dollars per million tokens. The defaults are Sonnet 5.5 first-party rates, so set your Bedrock rates.
+   - `prices` are dollars per million tokens. The defaults are Sonnet 5.5 first-party rates, so set your Bedrock rates. pi's model catalog lists the rate it uses for your model.
    - `rolloverTokens: 0` turns rollover off.
+   - `continuationProbability` (0 to 1, unset by default) is your chance of coming back while the cache could still be warm. Without it, pi assumes 15% and only warms contexts above about 190K tokens, so smaller sessions pay a full rewrite after every pause longer than the cache lifetime. Setting it to 0.4 starts warming at about 60K tokens, and a lower `minSavings` moves that lower. `minSavings` is the dollar floor a refresh must clear.
+   - A refresh costs money whether or not you return, and warming ends after 30 minutes idle (about 6 refreshes). It pays when your chance of returning in that window exceeds roughly `6 * refresh cost / rewrite premium`, about 25% for Sonnet 5.5 on Bedrock. Set the probability to your real return rate.
    - Settings are read when a session starts.
 
 ## Use
