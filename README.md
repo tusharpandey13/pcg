@@ -14,6 +14,7 @@ pi already has a cache warmer that refreshes the cache before it expires, but it
 
 | Situation | What pcg does |
 |---|---|
+| You send a prompt, or the model is about to run a tool | Shows an estimate in the status line, never blocking: `~$0.08 · cache warm · 1–6 requests · high $0.21` (a cold cache shows `cache cold (rewrite)`), then `next step ~$0.02 (150K read + ~3K write)` before each tool call. Estimates are rough, and cleared when the run ends |
 | A wake is certain, such as a worker still running that will report back | Keeps warming until the wake arrives, up to the break-even point or pi's 30-minute idle limit |
 | Credentials expired: a refresh gets a 401 or 403, or gets no response at all (for example a credential helper waiting on MFA) | Stops warming instead of retrying every 4.5 minutes, and shows "AWS credentials expired" or "AWS credentials unavailable". The next real request recovers. |
 | Warming is about to stop and the context is large | Writes a **checkpoint** as a turn inside the session while the cache is warm, at about 0.1× the context |

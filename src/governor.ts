@@ -197,6 +197,29 @@ const estimateStats = (branch: Entry[]) =>
 		}),
 	);
 
+// ---- cost before action ------------------------------------------------------
+
+/** New tokens assumed for a tool-result request when the session has no growth history yet. */
+export const FALLBACK_STEP_TOKENS = 3000;
+/** Assistant messages (requests) in each completed turn: the runs between consecutive user messages. */
+export function requestsPerTurn(branch: Entry[]): number[] {
+	const turns: number[] = [];
+	let n = 0;
+	for (const e of branch) {
+		if (e.type === "message" && e.message.role === "user") {
+			if (n > 0) turns.push(n);
+			n = 0;
+		} else if (asMsg(e)) n++;
+	}
+	if (n > 0) turns.push(n);
+	return turns;
+}
+/** Prompt growth between consecutive requests (new tokens per step); unknown or shrinking steps are skipped. */
+export function stepGrowth(branch: Entry[]): number[] {
+	const sizes = branch.map(asMsg).filter((m): m is Msg => !!m).map(tokensOf);
+	return sizes.flatMap((t, i) => (i > 0 && t !== undefined && sizes[i - 1] !== undefined && t >= sizes[i - 1]! ? [t - sizes[i - 1]!] : []));
+}
+
 // ---- checkpoint --------------------------------------------------------------
 
 interface Checkpoint {
@@ -218,6 +241,7 @@ const NO_RESPONSE = "AWS credentials unavailable";
 const usd = (n: number) => (Number.isFinite(n) ? `$${n.toFixed(n < 0.1 ? 3 : 2)}` : "unknown");
 const k = (n: number) => `${Math.round(n / 1000)}K`;
 const MIN = 60_000;
+const COST_KEY = "governor-cost";
 /** pi caps idle warming at 30 minutes after the request that started the run; we act at 29. */
 const IDLE_LIMIT = 29 * MIN;
 const CHOICES = {
@@ -248,6 +272,7 @@ export default function governor(pi: ExtensionAPI) {
 	let refreshing = false;
 	let remember: "resume" | "continue" | undefined;
 	let pending: { text: string; saved: number } | undefined;
+	let costShown = false; // a governor-cost status is on screen, so it needs clearing
 	let predicted: { est: Estimate; warm: boolean; approx: true } | undefined; // the in-flight real request's estimate
 
 	/** Crash-proof a handler: log once per name and fail safe (undefined = no checkpoint, no switch, message delivered). */
@@ -397,6 +422,44 @@ export default function governor(pi: ExtensionAPI) {
 		pi.appendEntry("governor-estimate", { predicted: p.est, actual: { usd: actual, tokens: tokensOf(m), outputTokens: fin(m.usage?.output) }, warm: p.warm, approx: p.approx });
 	});
 
+	/** Feature 7 step 2: show an estimate, never block or change anything. Unknown inputs clear the status. */
+	const showCost = (ctx: ExtensionContext, text: string | undefined) => {
+		if (text === undefined && !costShown) return;
+		costShown = text !== undefined;
+		try {
+			ctx.ui.setStatus(COST_KEY, text);
+		} catch {} // display only: never let it break the settle or checkpoint logic
+	};
+	const promptCost = guard("cost-prompt", (text: string, ctx: ExtensionContext) => {
+		const branch: Entry[] = ctx.sessionManager.getBranch();
+		const [last, touch] = [lastRequest(branch), lastTouch(branch)];
+		const recentOutputs = branch.flatMap((e) => asMsg(e)?.usage?.output ?? []).slice(-10);
+		const warm = touch !== undefined && Date.now() - touch < ttlOf(ctx);
+		const added = String(text).length / 4;
+		const est = last && touch !== undefined && estimateRequest({ priorTokens: last.tokens, warm, newTokens: added, recentOutputs, prices: pricesOf(ctx.model, cfg.prices) });
+		// Only the first request can be cold; the rest of the turn reads the cache it just wrote.
+		const step = last && stepCost(branch, last.tokens + added, ctx);
+		if (!est || !step) return showCost(ctx, undefined);
+		const turns = requestsPerTurn(branch).slice(-10);
+		const [lo, mid, hi] = turns.length >= 2 ? [Math.min(...turns), median(turns), Math.max(...turns)] : [1, 1, 1];
+		const reqs = turns.length < 2 ? "1+ requests" : lo === hi ? `${lo} requests` : `${lo}\u2013${hi} requests`;
+		const turnCost = (first: number, each: number, n: number) => first + (n - 1) * each;
+		showCost(ctx, `~${usd(turnCost(est.usd, step.usd, mid))} \u00b7 ${warm ? "cache warm" : "cache cold (rewrite)"} \u00b7 ${reqs} \u00b7 high ${usd(turnCost(est.high, step.high, hi))}`);
+	});
+	/** A follow-up request inside a run: the context is warm and grows by this session's typical step. */
+	const stepCost = (branch: Entry[], priorTokens: number, ctx: ExtensionContext) => {
+		const growth = stepGrowth(branch).slice(-10);
+		const recentOutputs = branch.flatMap((e) => asMsg(e)?.usage?.output ?? []).slice(-10);
+		return estimateRequest({ priorTokens, warm: true, newTokens: growth.length ? median(growth) : FALLBACK_STEP_TOKENS, recentOutputs, prices: pricesOf(ctx.model, cfg.prices) });
+	};
+	// The tool result triggers another request.
+	on("tool_call", (_e, ctx) => {
+		const branch: Entry[] = ctx.sessionManager.getBranch();
+		const last = lastRequest(branch);
+		const est = last && stepCost(branch, last.tokens, ctx);
+		showCost(ctx, est ? `next step ~${usd(est.usd)} (${k(est.breakdown.cacheReadTokens)} read + ~${k(est.breakdown.writeTokens)} write)` : undefined);
+	});
+
 	on("agent_start", (_e, ctx) => {
 		refreshing = false;
 		warmCount = 0;
@@ -420,6 +483,7 @@ export default function governor(pi: ExtensionAPI) {
 
 	// Features 3 + 5: finish a checkpoint turn, or start a rollover.
 	on("agent_settled", (ev, ctx) => {
+		showCost(ctx, undefined); // the run is over: a stale figure must not look current
 		const branch: Entry[] = ctx.sessionManager.getBranch();
 		if (phase === "checkpoint") {
 			phase = "idle";
@@ -450,6 +514,7 @@ export default function governor(pi: ExtensionAPI) {
 			return { action: "handled" };
 		}
 		attempted = ended = false; // the user spoke: a new idle period
+		promptCost(ev.text, ctx);
 		if (!checkpoint) return;
 		const branch = ctx.sessionManager.getBranch();
 		const touch = lastTouch(branch);
