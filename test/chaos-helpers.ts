@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { vi } from "vitest";
-import governor, { breakEvenRefreshes, lastRequest, loadConfig, refreshesSince } from "../src/governor.ts";
+import governor, { breakEvenRefreshes, economicWarm, hasOwnEconomics, lastRequest, loadConfig, refreshesSince } from "../src/governor.ts";
 import { assistant, setup, T0, usage, warm } from "./helpers.ts";
 
 export const MIN = 60_000;
@@ -138,7 +138,15 @@ export function makeSim(o: SimOpts = {}) {
 				const want = s.authStopped ? "stop" : !spent && !s.ended ? "warm" : "stop";
 				if (r?.action !== want) s.decisionViolations.push(`wakes=${[...wakeSet]} warmCount=${s.warmCount} refreshes=${refreshesSince(branchBefore as never)} cap=${cap} ended=${s.ended} auth=${s.authStopped} want=${want} got=${r?.action}`);
 				if (!s.authStopped) { if (final || spent) s.ended = true; if (r?.action === "warm") s.warmCount++; }
-			} else if (r?.action === "warm") s.decisionViolations.push("forced warm without a wake");
+			} else if (r?.action === "warm") {
+				// Without a wake, warm is only legal when the user's own economics (floor or probability) say so, and within the cap.
+				const ev = { action, warmCost: 0.05, missCost: 0.5, continuationProbability: 0.15 };
+				const spent = Math.max(s.warmCount, refreshesSince(branchBefore as never)) >= cap;
+				if (!hasOwnEconomics(cfg)) s.decisionViolations.push("forced warm without a wake");
+				else if (!economicWarm(ev, cfg)) s.decisionViolations.push("warm against the configured economics");
+				else if (spent) s.decisionViolations.push("warm past the break-even cap");
+				else if (!s.authStopped) s.warmCount++;
+			}
 			s.refreshing = eff === "warm";
 			if (eff === "warm" && opts.append !== false) g.branch.push(warm(now()));
 			if (eff === "stop") await flush();

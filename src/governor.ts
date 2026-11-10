@@ -20,12 +20,18 @@ export interface GovernorConfig {
 	rolloverTokens: number;
 	askOnReturn: boolean;
 	prices: Prices;
+	/** Warm when (probability * rewrite premium - refresh cost) is at least this many dollars. pi's own floor is 0.05. */
+	minSavings: number;
+	/** Chance that you continue while idle, replacing pi's fixed 15%; undefined keeps pi's value. */
+	continuationProbability?: number;
 }
 export const DEFAULTS: GovernorConfig = {
 	checkpointMinTokens: 100_000,
 	rolloverTokens: 200_000,
 	askOnReturn: true,
 	prices: { input: 2, cacheWrite: 2.5, cacheRead: 0.2, output: 10 }, // Sonnet 5.5 first-party, $/MTok
+	minSavings: 0.05,
+	continuationProbability: undefined,
 };
 
 /** Read the `governor` block of pi's settings, falling back to defaults per key. */
@@ -36,6 +42,8 @@ export function loadConfig(settings: unknown): GovernorConfig {
 		checkpointMinTokens: num(g.checkpointMinTokens, DEFAULTS.checkpointMinTokens),
 		rolloverTokens: num(g.rolloverTokens, DEFAULTS.rolloverTokens),
 		askOnReturn: typeof g.askOnReturn === "boolean" ? g.askOnReturn : DEFAULTS.askOnReturn,
+		minSavings: num(g.minSavings, DEFAULTS.minSavings),
+		continuationProbability: typeof g.continuationProbability === "number" && g.continuationProbability >= 0 && g.continuationProbability <= 1 ? g.continuationProbability : undefined,
 		prices: {
 			input: num(g.prices?.input, DEFAULTS.prices.input),
 			cacheWrite: num(g.prices?.cacheWrite, DEFAULTS.prices.cacheWrite),
@@ -43,6 +51,21 @@ export function loadConfig(settings: unknown): GovernorConfig {
 			output: num(g.prices?.output, DEFAULTS.prices.output),
 		},
 	};
+}
+
+/** True when the user changed how the governor judges a refresh, so its own economics replace pi's decision. */
+export const hasOwnEconomics = (cfg: GovernorConfig): boolean => cfg.continuationProbability !== undefined || cfg.minSavings !== DEFAULTS.minSavings;
+
+/**
+ * Warm when the expected saving clears the configured floor. pi's decision carries the costs it computed from
+ * the model's prices; only the idle probability (below 1) is replaced. Unknown economics (no rewrite premium)
+ * fall back to pi's own action.
+ */
+export function economicWarm(ev: { action: string; warmCost: number; missCost: number; continuationProbability: number }, cfg: GovernorConfig): boolean {
+	const [warmCost, missCost, piP] = [fin(ev.warmCost), fin(ev.missCost), fin(ev.continuationProbability)];
+	if (warmCost === undefined || missCost === undefined || piP === undefined || missCost <= 0) return ev.action === "warm";
+	const p = piP < 1 ? (cfg.continuationProbability ?? piP) : piP;
+	return p * missCost - warmCost >= cfg.minSavings;
 }
 
 /** Refreshes whose total cost equals one rewrite: (write - read) / read. */
@@ -288,13 +311,15 @@ export default function governor(pi: ExtensionAPI) {
 		const final = last !== undefined && Date.now() + ttlOf(ctx) * 0.9 > last.ts + IDLE_LIMIT;
 		const forced = wakes.size > 0;
 		const spent = Math.max(warmCount, refreshesSince(branch)) >= breakEvenRefreshes(cfg.prices);
-		const warm = forced ? !spent && !ended : !checkpoint && ev.action === "warm" && !final;
+		// With a configured floor or probability the governor judges the refresh itself, and the break-even cap applies as for a wake.
+		const own = !forced && hasOwnEconomics(cfg);
+		const warm = forced ? !spent && !ended : !checkpoint && (own ? economicWarm(ev, cfg) && !spent : ev.action === "warm") && !final;
 		// Checkpoint before warming ends: at pi's idle stop (even if a wake still holds warming), at the cap, or when pi stops.
 		if ((final || !warm) && !checkpoint && !attempted && phase === "idle" && ctx.isIdle() && last && last.tokens >= cfg.checkpointMinTokens) startCheckpoint(ctx, false);
 		if (forced && (final || spent)) ended = true; // warming ends here; a restarted run after the checkpoint must not warm on
 		if (!warm) return { action: "stop" };
 		refreshing = true;
-		if (!forced) return;
+		if (!forced && !own) return;
 		warmCount++;
 		return { action: "warm" };
 	});
@@ -461,7 +486,7 @@ export default function governor(pi: ExtensionAPI) {
 					`Refreshes: ${r.refreshes} (${usd(r.refreshCost)})   break-even cap: ${breakEvenRefreshes(p)}`,
 					`Checkpoints: ${r.checkpoints} (${usd(r.checkpointCost)})   rollovers: ${r.rollovers}   continued from checkpoint: ${r.continues}`,
 					`Rewrites avoided: ${r.rewritesAvoided}   saved: ${usd(r.saved)}   net: ${usd(r.net)}`,
-					`Config: checkpoint>=${k(cfg.checkpointMinTokens)} rollover>${cfg.rolloverTokens ? k(cfg.rolloverTokens) : "off"} ask=${cfg.askOnReturn} prices(in/write/read/out)=${p.input}/${p.cacheWrite}/${p.cacheRead}/${p.output}` +
+					`Config: checkpoint>=${k(cfg.checkpointMinTokens)} rollover>${cfg.rolloverTokens ? k(cfg.rolloverTokens) : "off"} ask=${cfg.askOnReturn} prices(in/write/read/out)=${p.input}/${p.cacheWrite}/${p.cacheRead}/${p.output} warm>=${usd(cfg.minSavings)} p=${cfg.continuationProbability ?? "pi"}` +
 						(wakes.size ? `   wakes expected: ${wakes.size}` : "") +
 						(authExpired ? "   warming stopped: AWS credentials expired or unavailable" : ""),
 				].join("\n"),

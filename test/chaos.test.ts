@@ -566,6 +566,7 @@ describe("environment", () => {
 		["missing block", {}], ["null block", { governor: null }], ["string block", { governor: "on" }], ["array block", { governor: [] }],
 		["null prices", { governor: { prices: null } }], ["NaN/Infinity", { governor: { rolloverTokens: NaN, checkpointMinTokens: Infinity, prices: { cacheRead: NaN, cacheWrite: Infinity } } }],
 		["askOnReturn string", { governor: { askOnReturn: "false" } }], ["undefined settings", undefined],
+		["warming economics junk", { governor: { minSavings: "0", continuationProbability: "0.5" } }], ["probability out of range", { governor: { continuationProbability: 7, minSavings: NaN } }],
 	];
 	it.each(garbage)("settings garbage: %s -> sane finite config, whole flow runs", async (_n, settings) => {
 		atk();
@@ -649,7 +650,7 @@ describe("environment", () => {
 // ============================ RANDOM INTERLEAVINGS =============================
 describe("seeded random interleavings", () => {
 	const RUNS = Number(process.env.CHAOS_RUNS ?? 40), STEPS = 250;
-	const garbageSettings = [undefined, {}, { governor: { prices: { cacheRead: 0.03, cacheWrite: 0.5 } } }, { governor: { rolloverTokens: 0 } }, { governor: { checkpointMinTokens: 1, rolloverTokens: 100_000 } }, { governor: { askOnReturn: false } }, { governor: { prices: { cacheRead: 0, cacheWrite: 0 } } }, { governor: "junk" }];
+	const garbageSettings = [undefined, {}, { governor: { prices: { cacheRead: 0.03, cacheWrite: 0.5 } } }, { governor: { rolloverTokens: 0 } }, { governor: { checkpointMinTokens: 1, rolloverTokens: 100_000 } }, { governor: { askOnReturn: false } }, { governor: { prices: { cacheRead: 0, cacheWrite: 0 } } }, { governor: "junk" }, { governor: { continuationProbability: 0.6, minSavings: 0.01 } }, { governor: { continuationProbability: 0, minSavings: 0 } }];
 	it(`runs ${RUNS} fuzz sessions x ${STEPS} steps from CHAOS_SEED=${SEED}`, async () => {
 		for (let run = 0; run < RUNS; run++) {
 			const seed = SEED + run * 7919;

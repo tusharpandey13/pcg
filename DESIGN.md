@@ -25,6 +25,19 @@ Cap: the smaller of two limits.
 
 Refreshes are counted by warm decisions, so a failed refresh (500, 429, timeout), which leaves no `cache_warm` entry, still counts. When the cap or the idle limit is reached while a wake is still expected, the governor checkpoints before warming ends, as in feature 3, and does not restart warming for that idle period.
 
+### 1b. Warm when you are likely to return
+
+pi warms on its own only if `p * missCost - refreshCost >= $0.05`, with `p` fixed at 0.15 for an idle session. With Sonnet 5.5 on Bedrock (write $2.50, read $0.10 per million tokens) that needs a context of about 190K tokens, so the common case of a 30K to 150K context is never warmed, and a pause of more than 5 minutes pays a full rewrite.
+
+Two optional settings let you replace those constants with your own numbers:
+
+- `continuationProbability` (0 to 1): your chance of returning while the cache could still be kept warm. It replaces pi's 0.15 for idle decisions only. Streaming decisions keep pi's value of 1.
+- `minSavings` (dollars): the floor on `p * missCost - refreshCost`. pi's value is 0.05.
+
+When either is set, the governor judges each refresh itself. It takes `missCost` and `refreshCost` from pi's decision event, which pi computes from the model's own prices, so they match your bill. The break-even cap and pi's 30-minute idle limit apply as for a wake. A wake still forces warming whatever these settings say. An auth failure still stops it. If pi reports no rewrite premium (unknown economics), the governor follows pi's action.
+
+The trade-off: a refresh costs `refreshCost` whether or not you return. Warming for the full 30 minutes is about 6 refreshes. It pays when the chance that you return in that window exceeds `6 * refreshCost / missCost`, about 25% with the prices above. Each single refresh pays when `p > refreshCost / missCost`, about 4%. Set `continuationProbability` to your honest return rate, and leave both unset to keep pi's behaviour.
+
 ### 2. Stop on auth errors
 
 Credentials expire, whether they come from an SSO profile or a `credential_process` helper. Warming stops until the next real request, instead of retrying every 4.5 minutes, in two cases:
@@ -92,6 +105,8 @@ All settings live in one block in pi's settings, with these defaults:
 | `rolloverTokens` | 200000 | Context size that triggers a rollover; 0 is off |
 | `askOnReturn` | true | Ask between resuming and continuing from the checkpoint |
 | `prices` | Sonnet 5.5 first-party | $ per million tokens: input, cache write, cache read, output. Set to your Bedrock rates |
+| `continuationProbability` | unset (pi's 0.15) | Your chance of returning while idle, 0 to 1. Replaces pi's constant for idle warming decisions |
+| `minSavings` | 0.05 | Dollars of expected saving a refresh must clear. Lowering it warms smaller contexts |
 
 ## Reporting
 
