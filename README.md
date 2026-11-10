@@ -81,6 +81,8 @@ pi loads TypeScript directly, so there is no build step, and pcg has no runtime 
        "rolloverTokens": 200000,
        "askOnReturn": true,
        "history": true,
+       "confirmAbove": 0,
+       "sessionBudget": 0,
        "prices": { "input": 2, "cacheWrite": 2.5, "cacheRead": 0.2, "output": 10 }
      }
    }
@@ -88,6 +90,8 @@ pi loads TypeScript directly, so there is no build step, and pcg has no runtime 
    - `prices` are dollars per million tokens. The defaults are Sonnet 5.5 first-party rates, so set your Bedrock rates.
    - `rolloverTokens: 0` turns rollover off.
    - `history: false` turns off the task history and the past-task part of the note.
+   - `confirmAbove` (dollars, 0 is off) asks before sending a prompt whose high estimate is above it, and before a task the model estimated above it. A declined prompt goes back to the editor.
+   - `sessionBudget` (dollars, 0 is off) asks once this session's recorded spend reaches it: allow another budget's worth, or block tool calls.
    - Settings are read when a session starts.
 
 ## Use
@@ -101,6 +105,13 @@ Work in pi as usual. pcg only acts when you pause or the context grows.
     Continue from checkpoint  ~$0.01 (new session, handoff + your message)
   ```
   The "don't ask again" variants remember your choice for the session.
+- **With `confirmAbove` set,** a costly prompt asks first:
+  ```
+  This prompt may cost up to ~$0.31
+  Typical ~$0.21 · cache warm · 1+ requests. Send it?
+  ```
+  Declining puts your message back in the editor. A task the model itself estimates above the limit asks once, and declining stops its tool calls.
+- **With `sessionBudget` set,** once the session has spent that much, each tool call asks "Allow another $B" or "Stop tool calls". Without a UI it blocks. The note to the model shows the budget left.
 - **`/governor`** reports, for the current session, from usage pi recorded:
   - refreshes and their cost;
   - checkpoints, rollovers and continues;

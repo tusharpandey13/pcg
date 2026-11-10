@@ -20,6 +20,8 @@ export interface GovernorConfig {
 	rolloverTokens: number;
 	askOnReturn: boolean;
 	history: boolean;
+	confirmAbove: number; // USD; 0 = never ask before a prompt or a model-estimated task
+	sessionBudget: number; // USD; 0 = no budget
 	prices: Prices;
 }
 export const DEFAULTS: GovernorConfig = {
@@ -27,6 +29,8 @@ export const DEFAULTS: GovernorConfig = {
 	rolloverTokens: 200_000,
 	askOnReturn: true,
 	history: true,
+	confirmAbove: 0,
+	sessionBudget: 0,
 	prices: { input: 2, cacheWrite: 2.5, cacheRead: 0.2, output: 10 }, // Sonnet 5.5 first-party, $/MTok
 };
 
@@ -39,6 +43,8 @@ export function loadConfig(settings: unknown): GovernorConfig {
 		rolloverTokens: num(g.rolloverTokens, DEFAULTS.rolloverTokens),
 		askOnReturn: typeof g.askOnReturn === "boolean" ? g.askOnReturn : DEFAULTS.askOnReturn,
 		history: typeof g.history === "boolean" ? g.history : DEFAULTS.history,
+		confirmAbove: num(g.confirmAbove, DEFAULTS.confirmAbove),
+		sessionBudget: num(g.sessionBudget, DEFAULTS.sessionBudget),
 		prices: {
 			input: num(g.prices?.input, DEFAULTS.prices.input),
 			cacheWrite: num(g.prices?.cacheWrite, DEFAULTS.prices.cacheWrite),
@@ -127,6 +133,12 @@ export function refreshesSince(branch: Entry[]): number {
 	let n = 0;
 	for (let i = branch.length - 1; i >= 0 && !asMsg(branch[i]); i--) if (isWarm(branch[i])) n++;
 	return n;
+}
+/** Dollars recorded on this branch: assistant usage plus cache_warm refreshes. Unknown numbers count as 0. */
+export function sessionSpent(branch: Entry[]): number {
+	let sum = 0;
+	for (const e of branch) sum += fin(asMsg(e)?.usage?.cost?.total ?? (isWarm(e) && e.type === "usage" ? e.usage?.cost?.total : undefined)) ?? 0;
+	return sum;
 }
 const textOf = (m: Msg): string => (m.content ?? []).flatMap((c) => (c.type === "text" ? [c.text] : [])).join("\n").trim();
 
@@ -293,9 +305,10 @@ export function calibration(history: TaskRecord[]): { n: number; median: number 
 const ratioText = (r: number) => `${(r > 1 ? r : 1 / r).toFixed(1)}x ${r > 1 ? "low" : "high"}`;
 const quote = (label: string) => `"${label.length > 40 ? `${label.slice(0, 40)}\u2026` : label}"`;
 /** The one-paragraph note given to the model with each user prompt; undefined when there is nothing to say. */
-export function buildBrief(a: { step?: string; session: TaskRecord[]; history: TaskRecord[]; prompt: string; model: string | undefined }): string | undefined {
+export function buildBrief(a: { step?: string; left?: number; session: TaskRecord[]; history: TaskRecord[]; prompt: string; model: string | undefined }): string | undefined {
 	const parts: string[] = [];
 	if (a.step) parts.push(a.step);
+	if (a.left !== undefined) parts.push(`Budget left ~${usd(a.left)}.`);
 	if (a.session.length >= 2) {
 		const u = a.session.map((r) => r.usd);
 		parts.push(`Tasks this session: typical ${usd(median(u))}, high ${usd(Math.max(...u))} (${u.length}).`);
@@ -376,9 +389,11 @@ export default function governor(pi: ExtensionAPI) {
 	let remember: "resume" | "continue" | undefined;
 	let pending: { text: string; saved: number } | undefined;
 	let costShown = false; // a governor-cost status is on screen, so it needs clearing
-	let task: { from: number; label: string; startedAt: number; estimate?: { usd: number; steps: number } } | undefined; // the open task: a user prompt until the run settles
+	let task: { from: number; label: string; startedAt: number; estimate?: { usd: number; steps: number }; reason?: string; gate?: "ok" | "declined" } | undefined; // the open task: a user prompt until the run settles
 	let past: TaskRecord[] = []; // history file records, last HISTORY_KEEP
 	let mine: TaskRecord[] = []; // records written by this session
+	let raised = 0; // USD added to sessionBudget by "Allow another", until session_start
+	let stopped = false; // the user chose "Stop tool calls" in this run
 	let predicted: { est: Estimate; warm: boolean; approx: true } | undefined; // the in-flight real request's estimate
 
 	/** Crash-proof a handler: log once per name and fail safe (undefined = no checkpoint, no switch, message delivered). */
@@ -478,6 +493,8 @@ export default function governor(pi: ExtensionAPI) {
 		warmCount = 0;
 		predicted = undefined;
 		task = undefined;
+		raised = 0;
+		stopped = false;
 		past = [];
 		mine = [];
 		checkpoint = undefined;
@@ -593,12 +610,17 @@ export default function governor(pi: ExtensionAPI) {
 		const est = last && touch !== undefined && estimateRequest({ priorTokens: last.tokens, warm, newTokens: added, recentOutputs, prices: pricesOf(ctx.model, cfg.prices) });
 		// Only the first request can be cold; the rest of the turn reads the cache it just wrote.
 		const step = last && stepCost(branch, last.tokens + added, ctx);
-		if (!est || !step) return showCost(ctx, undefined);
+		if (!est || !step) {
+			showCost(ctx, undefined);
+			return;
+		}
 		const turns = requestsPerTurn(branch).slice(-10);
 		const [lo, mid, hi] = turns.length >= 2 ? [Math.min(...turns), median(turns), Math.max(...turns)] : [1, 1, 1];
 		const reqs = turns.length < 2 ? "1+ requests" : lo === hi ? `${lo} requests` : `${lo}\u2013${hi} requests`;
 		const turnCost = (first: number, each: number, n: number) => first + (n - 1) * each;
-		showCost(ctx, `~${usd(turnCost(est.usd, step.usd, mid))} \u00b7 ${warm ? "cache warm" : "cache cold (rewrite)"} \u00b7 ${reqs} \u00b7 high ${usd(turnCost(est.high, step.high, hi))}`);
+		const [typical, high, cache] = [turnCost(est.usd, step.usd, mid), turnCost(est.high, step.high, hi), warm ? "cache warm" : "cache cold (rewrite)"];
+		showCost(ctx, `~${usd(typical)} \u00b7 ${cache} \u00b7 ${reqs} \u00b7 high ${usd(high)}`);
+		return { typical, high, cache, reqs };
 	});
 	/** A follow-up request inside a run: the context is warm and grows by this session's typical step. */
 	const stepCost = (branch: Entry[], priorTokens: number, ctx: ExtensionContext, warm = true) => {
@@ -606,17 +628,64 @@ export default function governor(pi: ExtensionAPI) {
 		const recentOutputs = branch.flatMap((e) => asMsg(e)?.usage?.output ?? []).slice(-10);
 		return estimateRequest({ priorTokens, warm, newTokens: growth.length ? median(growth) : FALLBACK_STEP_TOKENS, recentOutputs, prices: pricesOf(ctx.model, cfg.prices) });
 	};
+	type EstimateArgs = { steps?: unknown; usd?: unknown; reason?: unknown };
+	/** Validate estimate_cost args and store them on the open task (last call wins). */
+	const recordEstimate = (p: EstimateArgs | undefined) => {
+		const [steps, cost] = [fin(p?.steps), fin(p?.usd)];
+		if (steps === undefined || !Number.isInteger(steps) || steps < 1 || cost === undefined) return "invalid" as const;
+		if (!task) return "no task" as const;
+		const reason = typeof p?.reason === "string" ? p.reason.replace(/\s+/g, " ").trim().slice(0, 80) : "";
+		task.estimate = { usd: cost, steps };
+		task.reason = reason;
+		return { steps, usd: cost, reason };
+	};
 	// The tool result triggers another request.
-	on("tool_call", (_e, ctx) => {
+	on("tool_call", async (e, ctx) => {
 		const branch: Entry[] = ctx.sessionManager.getBranch();
 		const last = lastRequest(branch);
 		const est = last && stepCost(branch, last.tokens, ctx);
 		showCost(ctx, est ? `next step ~${usd(est.usd)} (${k(est.breakdown.cacheReadTokens)} read + ~${k(est.breakdown.writeTokens)} write)` : undefined);
+		// Gates (opt-in). Never the checkpoint turn, never estimate_cost. pi runs every tool_call hook of a
+		// response before any tool executes, so record the estimate here: calls batched with it are gated.
+		if (e.toolName === "estimate_cost") {
+			recordEstimate((e as { input?: EstimateArgs }).input);
+			return;
+		}
+		if (phase === "checkpoint") return;
+		if (cfg.sessionBudget > 0) {
+			try {
+				const [budget, spent] = [cfg.sessionBudget + raised, sessionSpent(branch)];
+				if (spent >= budget) {
+					let pick: string | undefined;
+					if (!stopped && ctx.hasUI) pick = await ctx.ui.select(`Session budget ${usd(budget)} spent (~${usd(spent)} so far)`, [`Allow another ${usd(cfg.sessionBudget)}`, "Stop tool calls"]);
+					if (pick?.startsWith("Allow another")) raised += cfg.sessionBudget;
+					else {
+						stopped = true;
+						return { block: true, terminate: true, reason: `Session budget of ${usd(budget)} is spent (~${usd(spent)}). Stop and ask the user before continuing.` };
+					}
+				}
+			} catch {
+				stopped = true; // fail closed: a budget gate that cannot ask blocks
+				return { block: true, terminate: true, reason: "Session budget is spent or could not be checked. Stop and ask the user before continuing." };
+			}
+		}
+		const t = task;
+		if (!t?.estimate || cfg.confirmAbove <= 0 || t.estimate.usd <= cfg.confirmAbove) return;
+		if (t.gate === undefined) {
+			t.gate = "ok"; // decided before the dialog opens: overlapping calls do not ask again, and a failed dialog fails open
+			if (ctx.hasUI) {
+				try {
+					if (!(await ctx.ui.confirm(`The model estimates this task at ~${usd(t.estimate.usd)}`, `${t.estimate.steps} steps${t.reason ? `: ${t.reason}` : ""}. Continue?`))) t.gate = "declined";
+				} catch {}
+			} else pi.appendEntry("governor-log", { msg: `task estimated at ~${usd(t.estimate.usd)}, above confirmAbove; allowed without asking (no UI)` });
+		}
+		if (t.gate === "declined") return { block: true, terminate: true, reason: `The user declined the estimated cost (~${usd(t.estimate.usd)}). Stop and ask the user how to proceed.` };
 	});
 
 	on("agent_start", (_e, ctx) => {
 		refreshing = false;
 		warmCount = 0;
+		stopped = false;
 		if (phase !== "checkpoint") attempted = ended = false;
 		if (authExpired) ctx.ui.setStatus("governor", undefined);
 		authExpired = false;
@@ -660,6 +729,38 @@ export default function governor(pi: ExtensionAPI) {
 		if (last && last.tokens > cfg.rolloverTokens) startCheckpoint(ctx, true);
 	});
 
+	const notice = (ctx: ExtensionContext, msg: string) => {
+		try {
+			ctx.ui.notify(msg, "info");
+		} catch {}
+	};
+	/** Prompt gate: ask before a costly prompt. True = declined (the text is back in the editor). Fails open. */
+	const declinedPrompt = async (text: string, cost: { typical: number; high: number; cache: string; reqs: string }, ctx: ExtensionContext) => {
+		if (!ctx.hasUI) {
+			pi.appendEntry("governor-log", { msg: `prompt may cost up to ~${usd(cost.high)}, above confirmAbove; sent without asking (no UI)` });
+			return false;
+		}
+		asking = true; // other inputs are held while the dialog is open
+		let ok = true;
+		try {
+			ok = await ctx.ui.confirm(`This prompt may cost up to ~${usd(cost.high)}`, `Typical ~${usd(cost.typical)} \u00b7 ${cost.cache} \u00b7 ${cost.reqs}. Send it?`);
+		} catch {}
+		asking = false;
+		try {
+			if (!ok) ctx.ui.setEditorText([text, ...held].join("\n\n")); // a failure here falls through and sends: the message is never lost
+		} catch {
+			ok = true;
+		}
+		if (ok) {
+			release();
+			return false;
+		}
+		held.length = 0;
+		showCost(ctx, undefined);
+		notice(ctx, "Not sent; your message is back in the editor.");
+		return true;
+	};
+
 	// Feature 4: on return after expiry, offer the checkpoint.
 	on("input", async (ev, ctx) => {
 		if (ev.source === "extension") return;
@@ -669,13 +770,19 @@ export default function governor(pi: ExtensionAPI) {
 			return { action: "handled" };
 		}
 		attempted = ended = false; // the user spoke: a new idle period
-		promptCost(ev.text, ctx);
-		if (!task || ctx.isIdle()) task = { from: ctx.sessionManager.getBranch().length, label: ev.text.replace(/\s+/g, " ").trim().slice(0, 80), startedAt: Date.now() };
+		const cost = promptCost(ev.text, ctx);
+		const branch: Entry[] = ctx.sessionManager.getBranch();
+		const [touch, last] = [lastTouch(branch), lastRequest(branch)];
+		const expired = touch !== undefined && !!last && Date.now() - touch > ttlOf(ctx);
+		const returnQuestion = !!checkpoint && expired && !remember && cfg.askOnReturn && ctx.hasUI;
+		if (cost && cfg.confirmAbove > 0 && cost.high > cfg.confirmAbove && !returnQuestion && !isOwnPrompt(ev.text) && (await declinedPrompt(ev.text, cost, ctx))) return { action: "handled" };
+		if (!task || ctx.isIdle()) task = { from: branch.length, label: ev.text.replace(/\s+/g, " ").trim().slice(0, 80), startedAt: Date.now() };
+		if (cfg.sessionBudget > 0) {
+			const [budget, spent] = [cfg.sessionBudget + raised, sessionSpent(branch)];
+			if (spent >= budget) notice(ctx, `Session budget spent (~${usd(spent)} of ${usd(budget)}): tool calls will ask first.`);
+		}
 		if (!checkpoint) return;
-		const branch = ctx.sessionManager.getBranch();
-		const touch = lastTouch(branch);
-		const last = lastRequest(branch);
-		if (touch === undefined || !last || Date.now() - touch <= ttlOf(ctx)) return closeCheckpoint();
+		if (touch === undefined || !last || !expired) return closeCheckpoint();
 		const writePrice = writePriceOf(pricesOf(ctx.model, cfg.prices));
 		const resumeCost = (last.tokens * writePrice) / 1e6;
 		const continueCost = (((checkpoint.text.length + ev.text.length) / 4) * writePrice) / 1e6;
@@ -719,7 +826,8 @@ export default function governor(pi: ExtensionAPI) {
 		const est = last && stepCost(branch, last.tokens, ctx, warm);
 		const step = est && (warm ? `Cache warm; each step reads ~${k(est.breakdown.cacheReadTokens)} tokens, ~${usd(est.usd)}.` : `Cache cold; the first step rewrites ~${k(est.breakdown.writeTokens)} tokens, ~${usd(est.usd)}.`);
 		const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
-		const content = buildBrief({ step, session: mine, history: past, prompt: ev.prompt, model });
+		const left = cfg.sessionBudget > 0 ? Math.max(0, cfg.sessionBudget + raised - sessionSpent(branch)) : undefined;
+		const content = buildBrief({ step, left, session: mine, history: past, prompt: ev.prompt, model });
 		return content ? { message: { customType: "governor-brief", content, display: false } } : undefined;
 	});
 
@@ -741,14 +849,13 @@ export default function governor(pi: ExtensionAPI) {
 			required: ["steps", "usd", "reason"],
 			additionalProperties: false,
 		} as never,
-		execute: async (_id: string, p: { steps?: unknown; usd?: unknown; reason?: unknown }, _s: unknown, _u: unknown, ctx: ExtensionContext) => {
+		execute: async (_id: string, p: EstimateArgs, _s: unknown, _u: unknown, ctx: ExtensionContext) => {
 			const text = (t: string) => ({ content: [{ type: "text" as const, text: t }], details: {} });
 			try {
-				const [steps, cost] = [fin(p?.steps), fin(p?.usd)];
-				if (steps === undefined || !Number.isInteger(steps) || steps < 1 || cost === undefined) return text("Invalid estimate: steps must be an integer >= 1 and usd a number >= 0. Nothing recorded.");
-				if (!task) return text("Not recorded: no open task.");
-				task.estimate = { usd: cost, steps };
-				const reason = typeof p.reason === "string" ? p.reason.replace(/\s+/g, " ").trim().slice(0, 80) : "";
+				const r = recordEstimate(p);
+				if (r === "invalid") return text("Invalid estimate: steps must be an integer >= 1 and usd a number >= 0. Nothing recorded.");
+				if (r === "no task") return text("Not recorded: no open task.");
+				const { steps, usd: cost, reason } = r;
 				try {
 					ctx.ui.notify(`Model estimate for this task: ~${usd(cost)}, ${steps} steps${reason ? ` (${reason})` : ""}`, "info");
 				} catch {}
@@ -832,7 +939,10 @@ export default function governor(pi: ExtensionAPI) {
 					`Rewrites avoided: ${r.rewritesAvoided}   saved: ${usd(r.saved)}   net: ${usd(r.net)}`,
 						es ? `Estimates: ${es.n} paired   predicted/actual median ${es.median.toFixed(2)}x   worst ${es.worst.toFixed(2)}x` : "Estimates: no estimates yet",
 					cfg.history ? `History: ${past.length} tasks (this session ${mine.length})` + (cal ? `   your estimates: median ratio ${cal.median.toFixed(2)}x (${cal.n})` : "") : "History: off",
-					`Config: checkpoint floor=${k(cfg.checkpointMinTokens)} rollover>${cfg.rolloverTokens ? k(cfg.rolloverTokens) : "off"} ask=${cfg.askOnReturn} prices(in/write/read/out)=${p.input}/${p.cacheWrite}/${p.cacheRead}/${p.output}` +
+					`Config: checkpoint floor=${k(cfg.checkpointMinTokens)} rollover>${cfg.rolloverTokens ? k(cfg.rolloverTokens) : "off"} ask=${cfg.askOnReturn}` +
+							(cfg.confirmAbove ? ` confirm>${usd(cfg.confirmAbove)}` : "") +
+							(cfg.sessionBudget ? ` budget ${usd(cfg.sessionBudget + raised)} (spent ~${usd(sessionSpent(ctx.sessionManager.getBranch()))})` : "") +
+							` prices(in/write/read/out)=${p.input}/${p.cacheWrite}/${p.cacheRead}/${p.output}` +
 						(wakes.size ? `   wakes expected: ${wakes.size}` : "") +
 						(authExpired ? "   warming stopped: AWS credentials expired or unavailable" : ""),
 				].join("\n"),

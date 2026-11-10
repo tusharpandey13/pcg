@@ -18,7 +18,7 @@ export const warm = (ts: number, cost = 0.05) => ({
 export const custom = (customType: string, data: unknown, ts = T0) => ({ type: "custom", customType, data, id: `e${n++}`, parentId: null, timestamp: new Date(ts).toISOString() });
 
 /** Minimal pi + ctx mocks: enough to drive the extension's handlers by hand. */
-export function setup(opts: { settings?: any; branch?: any[]; hasUI?: boolean; cwd?: string; select?: string | undefined } = {}) {
+export function setup(opts: { settings?: any; branch?: any[]; hasUI?: boolean; cwd?: string; select?: string | undefined; confirm?: boolean } = {}) {
 	const handlers = new Map<string, (e: any, c: any) => any>();
 	const commands = new Map<string, (a: string, c: any) => any>();
 	const tools = new Map<string, any>();
@@ -28,7 +28,9 @@ export function setup(opts: { settings?: any; branch?: any[]; hasUI?: boolean; c
 	const branch = opts.branch ?? [];
 	const newSession = vi.fn(async (o: any) => { await o.withSession?.({ sendUserMessage: async (t: string) => void sent.push({ text: `[new] ${t}` }) }); return { cancelled: false }; });
 	const select = vi.fn(async (_t: string, _o: string[]) => opts.select);
-	const ui = { setStatus: vi.fn(), notify: vi.fn(), select };
+	const confirm = vi.fn(async (_t: string, _m: string) => opts.confirm ?? true);
+	const setEditorText = vi.fn();
+	const ui = { setStatus: vi.fn(), notify: vi.fn(), select, confirm, setEditorText };
 	const ctx: any = {
 		ui, hasUI: opts.hasUI ?? true, cwd: opts.cwd ?? "/nonexistent", model: { provider: "p", id: "m", promptCache: { short: 300 } },
 		isIdle: () => true, newSession,
@@ -45,5 +47,5 @@ export function setup(opts: { settings?: any; branch?: any[]; hasUI?: boolean; c
 	};
 	governor(pi);
 	const fire = (ev: string, e: any = {}) => handlers.get(ev)!(e, ctx);
-	return { pi, ctx, fire, commands, tools, sent, entries, branch, ui, select, newSession };
+	return { pi, ctx, fire, commands, tools, sent, entries, branch, ui, select, confirm, setEditorText, newSession };
 }
