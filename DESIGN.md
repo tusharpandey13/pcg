@@ -80,7 +80,7 @@ When a run settles and the context is above the cap (default 200K tokens), the g
 
 Phase 2 starts after phase 1 has been used for real.
 
-### 7. Cost before action (proposed, not built)
+### 7. Cost before action (step 1 built; the rest proposed)
 
 Every action is priced before it runs, the price is shown to the user, and the model plans with the same numbers. This replaces the fixed thresholds of features 1, 3 and 5 with one estimator.
 
@@ -109,7 +109,7 @@ Showing never blocks. A gate is opt-in: `confirmAbove` asks before a prompt whos
 - Estimates are always labelled as estimates. `/governor` reports keep using recorded usage only, and show predicted against actual cost.
 - Steps per task are decided by the model, so a task's cost is a range, not a number. The budget gate is the hard limit.
 
-**Order.** (1) estimator and predicted-vs-actual logging, nothing shown; (2) show before prompt and tool call; (3) features 1, 3 and 5 move to the estimator; (4) history, brief and `estimate_cost`; (5) gates. Each step is tested against recorded sessions and the faux provider, with no paid runs.
+**Order.** (1) estimator and predicted-vs-actual logging, nothing shown (**built**: `estimateRequest` prices each real request at the model's catalog prices from pi (`prices` only when the model has none; a model without a cache-write price bills new tokens at input) in `before_provider_request`, with input size approximated as payload characters / 4 because exact tokens are unknown before the call; cache-warming refreshes are skipped; `message_end` pairs the prediction with the usage pi recorded and appends a `governor-estimate` entry; `/governor` shows the paired count and the median and worst predicted/actual ratio; `npm run calibrate -- <session.jsonl>` replays the estimator over a recorded session, offline, at the prices recorded in it; it assumes a 5-minute cache lifetime, so providers that keep caches longer show outliers); (2) show before prompt and tool call; (3) features 1, 3 and 5 move to the estimator; (4) history, brief and `estimate_cost`; (5) gates. Each step is tested against recorded sessions and the faux provider, with no paid runs.
 
 ## Failing safe
 

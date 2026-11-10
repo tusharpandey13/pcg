@@ -144,6 +144,59 @@ export function buildReport(branch: Entry[], cfg: GovernorConfig, ttlMs: number)
 	return r;
 }
 
+// ---- estimator (feature 7, step 1: logged only, never shown or acted on) -----
+
+export interface Estimate {
+	usd: number;
+	low: number;
+	high: number;
+	breakdown: { cacheReadTokens: number; writeTokens: number; outputTokens: number };
+}
+const median = (xs: number[]) => {
+	const s = [...xs].sort((a, b) => a - b);
+	return s.length % 2 ? s[s.length >> 1] : (s[s.length / 2 - 1] + s[s.length / 2]) / 2;
+};
+/**
+ * Price one request before it runs. Warm: the prior context is read from cache and the rest is written.
+ * Cold: everything is written. A model with no cache-write price (cacheWrite 0) bills new tokens at input.
+ * Output is the median of recent outputs; low/high use their min and max.
+ * Any unknown input (non-finite, negative, no recent outputs) gives undefined.
+ */
+export function estimateRequest(a: { priorTokens: unknown; warm: boolean; newTokens: unknown; recentOutputs: unknown[]; prices: Prices }): Estimate | undefined {
+	const [prior, added] = [fin(a.priorTokens), fin(a.newTokens)];
+	const outs = a.recentOutputs.map(fin);
+	const p = a.prices;
+	if (prior === undefined || added === undefined || !outs.length || outs.some((o) => o === undefined)) return;
+	if (![p.input, p.cacheRead, p.cacheWrite, p.output].every((x) => fin(x) !== undefined)) return;
+	const writePrice = p.cacheWrite > 0 ? p.cacheWrite : p.input;
+	const o = outs as number[];
+	const read = a.warm ? prior : 0;
+	const write = a.warm ? added : prior + added;
+	const cost = (out: number) => (read * p.cacheRead + write * writePrice + out * p.output) / 1e6;
+	return { usd: cost(median(o)), low: cost(Math.min(...o)), high: cost(Math.max(...o)), breakdown: { cacheReadTokens: read, writeTokens: write, outputTokens: median(o) } };
+}
+/** The model's catalog prices from pi ($/MTok, the same source as recorded costs); config `prices` when the model has none. */
+export function pricesOf(model: { cost?: unknown } | undefined, fallback: Prices): Prices {
+	const c = model?.cost as Partial<Prices> | undefined;
+	const v = [fin(c?.input), fin(c?.cacheWrite), fin(c?.cacheRead), fin(c?.output)];
+	return v.every((x) => x !== undefined) ? { input: v[0]!, cacheWrite: v[1]!, cacheRead: v[2]!, output: v[3]! } : fallback;
+}
+/** Predicted/actual ratios: the median, and the worst (farthest from 1 in either direction). */
+export function ratioStats(ratios: number[]): { n: number; median: number; worst: number } | undefined {
+	const r = ratios.filter((x) => Number.isFinite(x) && x > 0);
+	if (!r.length) return;
+	return { n: r.length, median: median(r), worst: r.reduce((w, x) => (Math.abs(Math.log(x)) > Math.abs(Math.log(w)) ? x : w)) };
+}
+const estimateStats = (branch: Entry[]) =>
+	ratioStats(
+		branch.flatMap((e) => {
+			if (e.type !== "custom" || e.customType !== "governor-estimate") return [];
+			const d = e.data as { predicted?: { usd?: unknown }; actual?: { usd?: unknown } } | undefined;
+			const [p, a] = [fin(d?.predicted?.usd), fin(d?.actual?.usd)];
+			return p !== undefined && a ? [p / a] : [];
+		}),
+	);
+
 // ---- checkpoint --------------------------------------------------------------
 
 interface Checkpoint {
@@ -195,6 +248,7 @@ export default function governor(pi: ExtensionAPI) {
 	let refreshing = false;
 	let remember: "resume" | "continue" | undefined;
 	let pending: { text: string; saved: number } | undefined;
+	let predicted: { est: Estimate; warm: boolean; approx: true } | undefined; // the in-flight real request's estimate
 
 	/** Crash-proof a handler: log once per name and fail safe (undefined = no checkpoint, no switch, message delivered). */
 	const logged = new Set<string>();
@@ -260,6 +314,7 @@ export default function governor(pi: ExtensionAPI) {
 		phase = "idle";
 		authExpired = refreshing = attempted = asking = ended = false;
 		warmCount = 0;
+		predicted = undefined;
 		checkpoint = undefined;
 		release();
 		// Rebuild an open checkpoint so the return prompt survives a restart.
@@ -318,6 +373,30 @@ export default function governor(pi: ExtensionAPI) {
 			ctx.ui.setStatus("governor", EXPIRED);
 		}
 	});
+	// Feature 7 step 1: predict each real request, then pair it with the usage pi records. Nothing is shown or acted on.
+	on("before_provider_request", (ev, ctx) => {
+		predicted = undefined;
+		if (refreshing && ctx.isIdle()) return; // a cache-warming refresh (same test as after_provider_response), not a real request
+		const branch: Entry[] = ctx.sessionManager.getBranch();
+		const [last, touch] = [lastRequest(branch), lastTouch(branch)];
+		if (!last || touch === undefined) return;
+		// Exact input tokens are not available before the request, so approximate from the payload: chars / 4.
+		const total = JSON.stringify(ev.payload).length / 4;
+		const recentOutputs = branch.flatMap((e) => asMsg(e)?.usage?.output ?? []).slice(-10);
+		const warm = Date.now() - touch < ttlOf(ctx);
+		const est = estimateRequest({ priorTokens: last.tokens, warm, newTokens: Math.max(0, total - last.tokens), recentOutputs, prices: pricesOf(ctx.model, cfg.prices) });
+		if (est) predicted = { est, warm, approx: true };
+	});
+	on("message_end", (ev) => {
+		const m = ev.message as Msg;
+		if (m.role !== "assistant" || !predicted) return;
+		const p = predicted;
+		predicted = undefined;
+		const actual = fin(m.usage?.cost?.total);
+		if (m.stopReason === "error" || m.stopReason === "aborted" || actual === undefined) return;
+		pi.appendEntry("governor-estimate", { predicted: p.est, actual: { usd: actual, tokens: tokensOf(m), outputTokens: fin(m.usage?.output) }, warm: p.warm, approx: p.approx });
+	});
+
 	on("agent_start", (_e, ctx) => {
 		refreshing = false;
 		warmCount = 0;
@@ -457,12 +536,14 @@ export default function governor(pi: ExtensionAPI) {
 		description: "Show prompt-cache savings for this session and the governor settings",
 		handler: guard("governor", async (_a: string, ctx: CmdCtx) => {
 			const r = buildReport(ctx.sessionManager.getBranch(), cfg, ttlOf(ctx));
+			const es = estimateStats(ctx.sessionManager.getBranch());
 			const p = cfg.prices;
 			ctx.ui.notify(
 				[
 					`Refreshes: ${r.refreshes} (${usd(r.refreshCost)})   break-even cap: ${breakEvenRefreshes(p)}`,
 					`Checkpoints: ${r.checkpoints} (${usd(r.checkpointCost)})   rollovers: ${r.rollovers}   continued from checkpoint: ${r.continues}`,
 					`Rewrites avoided: ${r.rewritesAvoided}   saved: ${usd(r.saved)}   net: ${usd(r.net)}`,
+						es ? `Estimates: ${es.n} paired   predicted/actual median ${es.median.toFixed(2)}x   worst ${es.worst.toFixed(2)}x` : "Estimates: no estimates yet",
 					`Config: checkpoint>=${k(cfg.checkpointMinTokens)} rollover>${cfg.rolloverTokens ? k(cfg.rolloverTokens) : "off"} ask=${cfg.askOnReturn} prices(in/write/read/out)=${p.input}/${p.cacheWrite}/${p.cacheRead}/${p.output}` +
 						(wakes.size ? `   wakes expected: ${wakes.size}` : "") +
 						(authExpired ? "   warming stopped: AWS credentials expired or unavailable" : ""),

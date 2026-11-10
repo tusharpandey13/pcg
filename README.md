@@ -130,6 +130,7 @@ npm install
 npm test            # unit, integration and chaos tests; no network, no cost
 npm run typecheck
 CHAOS_SEED=7 CHAOS_RUNS=300 npm test   # more seeded fuzzing
+npm run calibrate -- session.jsonl   # replay the cost estimator over a recorded pi session; offline
 ```
 
 - [DESIGN.md](DESIGN.md) is the contract.

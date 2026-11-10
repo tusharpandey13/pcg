@@ -15,7 +15,8 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "demo": "vitest run --config vitest.demo.config.ts --silent=false"
+    "demo": "vitest run --config vitest.demo.config.ts --silent=false",
+    "calibrate": "node demo/calibrate.ts"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "1.5.0",
