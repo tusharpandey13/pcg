@@ -47,6 +47,8 @@ When warming is about to stop and the context is large (default 100K tokens or m
 
 A checkpoint costs about 0.1x the context plus output. That is worth paying only when the cache will probably expire before you return, which is exactly when warming stops.
 
+The checkpoint takes the slot of the last refresh before pi's 30-minute idle stop (the governor acts at 29 minutes). When no checkpoint will be taken, for example because the context is under the threshold or one was already attempted, that last refresh is sent as usual.
+
 The handoff is taken only from the checkpoint turn's own assistant message (messages after the turn started), never from "the last assistant message". `handoff.md` counts only if it is a readable file written after the checkpoint started; otherwise the reply is used, with a notice. There is at most one checkpoint attempt per idle period (until the next real request), whatever the outcome.
 
 A user message that arrives while the checkpoint turn runs is held and sent when the turn settles, with the notice "Saving handoff, your message follows". It is never steered into the checkpoint turn.

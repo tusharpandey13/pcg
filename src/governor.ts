@@ -288,9 +288,11 @@ export default function governor(pi: ExtensionAPI) {
 		const final = last !== undefined && Date.now() + ttlOf(ctx) * 0.9 > last.ts + IDLE_LIMIT;
 		const forced = wakes.size > 0;
 		const spent = Math.max(warmCount, refreshesSince(branch)) >= breakEvenRefreshes(cfg.prices);
-		const warm = forced ? !spent && !ended : !checkpoint && ev.action === "warm" && !final;
+		const canCheckpoint = !checkpoint && !attempted && phase === "idle" && ctx.isIdle() && last !== undefined && last.tokens >= cfg.checkpointMinTokens;
+		// The last slot before pi's idle stop goes to the checkpoint when one will be taken; otherwise it is a normal refresh.
+		const warm = forced ? !spent && !ended : !checkpoint && ev.action === "warm" && !(final && canCheckpoint);
 		// Checkpoint before warming ends: at pi's idle stop (even if a wake still holds warming), at the cap, or when pi stops.
-		if ((final || !warm) && !checkpoint && !attempted && phase === "idle" && ctx.isIdle() && last && last.tokens >= cfg.checkpointMinTokens) startCheckpoint(ctx, false);
+		if ((final || !warm) && canCheckpoint) startCheckpoint(ctx, false);
 		if (forced && (final || spent)) ended = true; // warming ends here; a restarted run after the checkpoint must not warm on
 		if (!warm) return { action: "stop" };
 		refreshing = true;

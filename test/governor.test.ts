@@ -184,6 +184,13 @@ describe("feature 3: checkpoint while warm", () => {
 		expect(await g.fire("cache_warming_decision", dec("warm"))).toEqual({ action: "stop" });
 		expect(g.sent).toHaveLength(1);
 	});
+	it("sends the last refresh before pi's 30-minute limit when no checkpoint will be taken", async () => {
+		const g = setup({ branch: big(50_000) }); // under checkpointMinTokens
+		g.fire("session_start");
+		vi.setSystemTime(T0 + 26 * MIN);
+		expect(await g.fire("cache_warming_decision", dec("warm"))).toBeUndefined(); // pi's warm stands
+		expect(g.sent).toHaveLength(0);
+	});
 	it("records the checkpoint when its turn settles and never starts a second one (loop guard)", async () => {
 		const g = setup({ branch: big() });
 		g.fire("session_start");
