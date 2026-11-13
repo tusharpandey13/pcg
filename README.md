@@ -80,6 +80,8 @@ pi loads TypeScript directly, so there is no build step, and pcg has no runtime 
        "checkpointMinTokens": 0,
        "rolloverTokens": 200000,
        "askOnReturn": true,
+       "idleCheckpoint": true,
+       "autoContinue": false,
        "history": true,
        "confirmAbove": 0,
        "sessionBudget": 0,
@@ -89,6 +91,7 @@ pi loads TypeScript directly, so there is no build step, and pcg has no runtime 
    ```
    - `prices` are dollars per million tokens. The defaults are Sonnet 5.5 first-party rates, so set your Bedrock rates.
    - `rolloverTokens: 0` turns rollover off.
+   - `idleCheckpoint` takes the checkpoint from the governor's own timer when pi's warmer is not running (for example in a host app that drives pi over RPC). `autoContinue: true` skips the return question and continues from the checkpoint when it saves at least $0.05, telling you what it saved. See `docs/SPEC-idle-checkpoint.md`.
    - `history: false` turns off the task history and the past-task part of the note.
    - `confirmAbove` (dollars, 0 is off) asks before sending a prompt whose high estimate is above it, and before a task the model estimated above it. A declined prompt goes back to the editor.
    - `sessionBudget` (dollars, 0 is off) asks once this session's recorded spend reaches it: allow another budget's worth, or block tool calls.

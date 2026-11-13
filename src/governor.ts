@@ -19,6 +19,8 @@ export interface GovernorConfig {
 	checkpointMinTokens: number;
 	rolloverTokens: number;
 	askOnReturn: boolean;
+	idleCheckpoint: boolean; // take the checkpoint from our own timer when pi's warmer makes no decision
+	autoContinue: boolean; // on return after expiry, continue from the checkpoint without asking when it saves enough
 	history: boolean;
 	confirmAbove: number; // USD; 0 = never ask before a prompt or a model-estimated task
 	sessionBudget: number; // USD; 0 = no budget
@@ -28,6 +30,8 @@ export const DEFAULTS: GovernorConfig = {
 	checkpointMinTokens: 0, // an optional floor: checkpointPays decides
 	rolloverTokens: 200_000,
 	askOnReturn: true,
+	idleCheckpoint: true,
+	autoContinue: false,
 	history: true,
 	confirmAbove: 0,
 	sessionBudget: 0,
@@ -42,6 +46,8 @@ export function loadConfig(settings: unknown): GovernorConfig {
 		checkpointMinTokens: num(g.checkpointMinTokens, DEFAULTS.checkpointMinTokens),
 		rolloverTokens: num(g.rolloverTokens, DEFAULTS.rolloverTokens),
 		askOnReturn: typeof g.askOnReturn === "boolean" ? g.askOnReturn : DEFAULTS.askOnReturn,
+		idleCheckpoint: typeof g.idleCheckpoint === "boolean" ? g.idleCheckpoint : DEFAULTS.idleCheckpoint,
+		autoContinue: typeof g.autoContinue === "boolean" ? g.autoContinue : DEFAULTS.autoContinue,
 		history: typeof g.history === "boolean" ? g.history : DEFAULTS.history,
 		confirmAbove: num(g.confirmAbove, DEFAULTS.confirmAbove),
 		sessionBudget: num(g.sessionBudget, DEFAULTS.sessionBudget),
@@ -360,6 +366,9 @@ const MIN = 60_000;
 const COST_KEY = "governor-cost";
 /** pi caps idle warming at 30 minutes after the request that started the run; we act at 29. */
 const IDLE_LIMIT = 29 * MIN;
+const IDLE_WATCHDOG = 0.92; // of the cache lifetime: after pi's first warming decision (0.9), before expiry
+const AUTO_MIN_SAVING = 0.05; // USD: below this an automatic return is not worth losing the full context
+const EVIDENCE_MIN_TOKENS = 10_000; // log "expired with no checkpoint" only for contexts that matter
 const CHOICES = {
 	resume: "Resume full context",
 	continue: "Continue from checkpoint",
@@ -387,7 +396,9 @@ export default function governor(pi: ExtensionAPI) {
 	let authExpired = false;
 	let refreshing = false;
 	let remember: "resume" | "continue" | undefined;
-	let pending: { text: string; saved: number } | undefined;
+	let pending: { text: string; saved: number; note?: string } | undefined;
+	let idleTimer: ReturnType<typeof setTimeout> | undefined; // the watchdog: checkpoint if pi's warmer has not taken over
+	let decided = false; // pi's warmer made a decision since the run settled, so its hook owns the checkpoint
 	let costShown = false; // a governor-cost status is on screen, so it needs clearing
 	let task: { from: number; label: string; startedAt: number; estimate?: { usd: number; steps: number }; reason?: string; gate?: "ok" | "declined" } | undefined; // the open task: a user prompt until the run settles
 	let past: TaskRecord[] = []; // history file records, last HISTORY_KEEP
@@ -434,6 +445,28 @@ export default function governor(pi: ExtensionAPI) {
 			else wakes.delete(id);
 		}),
 	);
+
+	const clearIdle = () => {
+		if (idleTimer) clearTimeout(idleTimer);
+		idleTimer = undefined;
+	};
+	/** Idle checkpoint (spec: docs/SPEC-idle-checkpoint.md). Armed when a run settles; stands down if pi's warmer decides first. */
+	const armIdle = (ctx: ExtensionContext, last: { tokens: number } | undefined) => {
+		clearIdle();
+		if (!cfg.idleCheckpoint || !last || last.tokens < cfg.checkpointMinTokens || !checkpointPays(last.tokens, pricesOf(ctx.model, cfg.prices))) return;
+		idleTimer = setTimeout(
+			guard("idle-checkpoint", () => {
+				idleTimer = undefined;
+				const branch: Entry[] = ctx.sessionManager.getBranch();
+				const [l, touch] = [lastRequest(branch), lastTouch(branch)];
+				if (decided || phase !== "idle" || attempted || checkpoint || authExpired || wakes.size > 0 || !ctx.isIdle() || !l || touch === undefined || Date.now() - touch >= ttlOf(ctx)) return;
+				pi.appendEntry("governor-log", { msg: `idle checkpoint at ${k(l.tokens)} tokens: no warming decision since the run settled` });
+				startCheckpoint(ctx, false);
+			}),
+			ttlOf(ctx) * IDLE_WATCHDOG,
+		);
+		idleTimer.unref?.();
+	};
 
 	const closeCheckpoint = () => {
 		if (!checkpoint) return;
@@ -489,7 +522,8 @@ export default function governor(pi: ExtensionAPI) {
 		cfg = loadConfig(pi.getSettings());
 		wakes.clear();
 		phase = "idle";
-		authExpired = refreshing = attempted = asking = ended = false;
+		authExpired = refreshing = attempted = asking = ended = decided = false;
+		clearIdle();
 		warmCount = 0;
 		predicted = undefined;
 		task = undefined;
@@ -511,6 +545,7 @@ export default function governor(pi: ExtensionAPI) {
 
 	// Feature 1 + 2 + 3: decide each refresh.
 	on("cache_warming_decision", (ev, ctx) => {
+		decided = true;
 		if (refreshing) {
 			// The previous refresh never got an HTTP response: credentials (for example a
 			// credential_process that needs MFA) or the network failed. Retrying would re-run the
@@ -683,6 +718,7 @@ export default function governor(pi: ExtensionAPI) {
 	});
 
 	on("agent_start", (_e, ctx) => {
+		clearIdle();
 		refreshing = false;
 		warmCount = 0;
 		stopped = false;
@@ -724,9 +760,11 @@ export default function governor(pi: ExtensionAPI) {
 			return;
 		}
 		finishTask(ctx, ev.aborted);
+		decided = false;
 		const last = lastRequest(branch);
-		if (ev.aborted || attempted || checkpoint || authExpired || wakes.size > 0 || cfg.rolloverTokens === 0) return;
-		if (last && last.tokens > cfg.rolloverTokens) startCheckpoint(ctx, true);
+		if (ev.aborted || attempted || checkpoint || authExpired || wakes.size > 0) return;
+		if (last && cfg.rolloverTokens > 0 && last.tokens > cfg.rolloverTokens) return startCheckpoint(ctx, true);
+		armIdle(ctx, last);
 	});
 
 	const notice = (ctx: ExtensionContext, msg: string) => {
@@ -770,16 +808,23 @@ export default function governor(pi: ExtensionAPI) {
 			return { action: "handled" };
 		}
 		attempted = ended = false; // the user spoke: a new idle period
+		clearIdle();
 		const cost = promptCost(ev.text, ctx);
 		const branch: Entry[] = ctx.sessionManager.getBranch();
 		const [touch, last] = [lastTouch(branch), lastRequest(branch)];
 		const expired = touch !== undefined && !!last && Date.now() - touch > ttlOf(ctx);
-		const returnQuestion = !!checkpoint && expired && !remember && cfg.askOnReturn && ctx.hasUI;
+		// Automatic return: switch without asking when the checkpoint saves enough (no UI needed).
+		const write = writePriceOf(pricesOf(ctx.model, cfg.prices));
+		const auto = !!checkpoint && expired && !remember && cfg.autoContinue && !!last && (last.tokens * write - ((checkpoint.text.length + ev.text.length) / 4) * write) / 1e6 >= AUTO_MIN_SAVING;
+		const returnQuestion = !!checkpoint && expired && !remember && ((cfg.askOnReturn && ctx.hasUI) || auto);
 		if (cost && cfg.confirmAbove > 0 && cost.high > cfg.confirmAbove && !returnQuestion && !isOwnPrompt(ev.text) && (await declinedPrompt(ev.text, cost, ctx))) return { action: "handled" };
 		if (!task || ctx.isIdle()) task = { from: branch.length, label: ev.text.replace(/\s+/g, " ").trim().slice(0, 80), startedAt: Date.now() };
 		if (cfg.sessionBudget > 0) {
 			const [budget, spent] = [cfg.sessionBudget + raised, sessionSpent(branch)];
 			if (spent >= budget) notice(ctx, `Session budget spent (~${usd(spent)} of ${usd(budget)}): tool calls will ask first.`);
+		}
+		if (expired && !checkpoint && last && last.tokens >= EVIDENCE_MIN_TOKENS) {
+			pi.appendEntry("governor-log", { msg: `cache expired with no checkpoint (${k(last.tokens)} tokens, idle ${Math.round((Date.now() - (touch ?? Date.now())) / MIN)} min, refreshes since last request ${refreshesSince(branch)})` });
 		}
 		if (!checkpoint) return;
 		if (touch === undefined || !last || !expired) return closeCheckpoint();
@@ -787,6 +832,12 @@ export default function governor(pi: ExtensionAPI) {
 		const resumeCost = (last.tokens * writePrice) / 1e6;
 		const continueCost = (((checkpoint.text.length + ev.text.length) / 4) * writePrice) / 1e6;
 		let choice = remember;
+		let note: string | undefined;
+		if (!choice && auto) {
+			choice = "continue";
+			note = `Cache expired ${Math.round((Date.now() - touch - ttlOf(ctx)) / MIN)} min ago; continuing from the checkpoint in a new session (~${usd(continueCost)} instead of ~${usd(resumeCost)}).`;
+			pi.appendEntry("governor-log", { msg: `auto-continue: ${note}` });
+		}
 		if (!choice && cfg.askOnReturn && ctx.hasUI) {
 			const ago = Math.round((Date.now() - touch - ttlOf(ctx)) / MIN);
 			asking = true;
@@ -812,7 +863,7 @@ export default function governor(pi: ExtensionAPI) {
 			release();
 			return closeCheckpoint();
 		}
-		pending = { text: [ev.text, ...held.splice(0)].join("\n\n"), saved: Math.max(0, resumeCost - continueCost) || 0 };
+		pending = { text: [ev.text, ...held.splice(0)].join("\n\n"), saved: Math.max(0, resumeCost - continueCost) || 0, note };
 		later(() => runCommand("governor-continue"));
 		return { action: "handled" };
 	});
@@ -920,7 +971,7 @@ export default function governor(pi: ExtensionAPI) {
 			const p = pending;
 			pending = undefined;
 			if (!p || !checkpoint) return;
-			if (await freshSession(ctx, "Continuing from the checkpoint in a new session.", p.text)) pi.appendEntry("governor-continue", { saved: p.saved });
+			if (await freshSession(ctx, p.note ?? "Continuing from the checkpoint in a new session.", p.text)) pi.appendEntry("governor-continue", { saved: p.saved });
 		}) as never,
 	});
 
@@ -939,7 +990,7 @@ export default function governor(pi: ExtensionAPI) {
 					`Rewrites avoided: ${r.rewritesAvoided}   saved: ${usd(r.saved)}   net: ${usd(r.net)}`,
 						es ? `Estimates: ${es.n} paired   predicted/actual median ${es.median.toFixed(2)}x   worst ${es.worst.toFixed(2)}x` : "Estimates: no estimates yet",
 					cfg.history ? `History: ${past.length} tasks (this session ${mine.length})` + (cal ? `   your estimates: median ratio ${cal.median.toFixed(2)}x (${cal.n})` : "") : "History: off",
-					`Config: checkpoint floor=${k(cfg.checkpointMinTokens)} rollover>${cfg.rolloverTokens ? k(cfg.rolloverTokens) : "off"} ask=${cfg.askOnReturn}` +
+					`Config: checkpoint floor=${k(cfg.checkpointMinTokens)} rollover>${cfg.rolloverTokens ? k(cfg.rolloverTokens) : "off"} ask=${cfg.askOnReturn} idle-checkpoint=${cfg.idleCheckpoint} auto-continue=${cfg.autoContinue}` +
 							(cfg.confirmAbove ? ` confirm>${usd(cfg.confirmAbove)}` : "") +
 							(cfg.sessionBudget ? ` budget ${usd(cfg.sessionBudget + raised)} (spent ~${usd(sessionSpent(ctx.sessionManager.getBranch()))})` : "") +
 							` prices(in/write/read/out)=${p.input}/${p.cacheWrite}/${p.cacheRead}/${p.output}` +

@@ -649,7 +649,7 @@ describe("environment", () => {
 // ============================ RANDOM INTERLEAVINGS =============================
 describe("seeded random interleavings", () => {
 	const RUNS = Number(process.env.CHAOS_RUNS ?? 40), STEPS = 250;
-	const garbageSettings = [undefined, {}, { governor: { prices: { cacheRead: 0.03, cacheWrite: 0.5 } } }, { governor: { rolloverTokens: 0 } }, { governor: { checkpointMinTokens: 1, rolloverTokens: 100_000 } }, { governor: { askOnReturn: false } }, { governor: { prices: { cacheRead: 0, cacheWrite: 0 } } }, { governor: "junk" }];
+	const garbageSettings = [undefined, {}, { governor: { prices: { cacheRead: 0.03, cacheWrite: 0.5 } } }, { governor: { rolloverTokens: 0 } }, { governor: { checkpointMinTokens: 1, rolloverTokens: 100_000 } }, { governor: { askOnReturn: false } }, { governor: { autoContinue: true } }, { governor: { autoContinue: true, idleCheckpoint: false } }, { governor: { prices: { cacheRead: 0, cacheWrite: 0 } } }, { governor: "junk" }];
 	it(`runs ${RUNS} fuzz sessions x ${STEPS} steps from CHAOS_SEED=${SEED}`, async () => {
 		for (let run = 0; run < RUNS; run++) {
 			const seed = SEED + run * 7919;

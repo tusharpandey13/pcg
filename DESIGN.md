@@ -63,6 +63,8 @@ The checkpoint takes the slot of the last refresh before pi's 30-minute idle sto
 
 The handoff is taken only from the checkpoint turn's own assistant message (messages after the turn started), never from "the last assistant message". `handoff.md` counts only if it is a readable file written after the checkpoint started; otherwise the reply is used, with a notice. There is at most one checkpoint attempt per idle period (until the next real request), whatever the outcome.
 
+**Idle checkpoint (watchdog).** Everything above is entered from pi's warming hook, which only fires while pi's warmer runs. On the maintainer's host app it mostly did not: 41 of 42 cold-cache rewrites had no refresh in the gap before them, so no checkpoint existed on return. When a run settles, the governor therefore arms its own timer for 0.92 x the cache lifetime, just after pi's first warming decision (0.9). If that decision came, the hook owns the checkpoint and the timer does nothing. If not, and the cache is still warm, the same in-session checkpoint turn runs now (and renews the cache for another lifetime). It shares the one-attempt-per-idle-period flag with the hook, is cleared by any user input, run start or session start, and is skipped below the `checkpointPays` threshold. `idleCheckpoint: false` turns it off. Spec and tests: `docs/SPEC-idle-checkpoint.md`.
+
 A user message that arrives while the checkpoint turn runs is held and sent when the turn settles, with the notice "Saving handoff, your message follows". It is never steered into the checkpoint turn.
 
 This adds one turn to the old session's history. The old session is not reused after a fresh start, so that does not matter.
@@ -77,7 +79,7 @@ Cache expired 23 min ago. Context: 342K tokens.
   Continue from checkpoint ~$0.08 (new session, handoff + your message)
 ```
 
-"Continue from checkpoint" starts a new session seeded with the handoff and your message. The question is single-flight: inputs that arrive while it is open are held and follow the choice. If the new session is refused or fails, the governor keeps the checkpoint open, tells you the switch failed, and sends your message to the current session. The same holds for rollover, which then reuses the open checkpoint instead of starting another. If `ui.select` throws, it resumes. Either choice is remembered for the session if you tick "don't ask again". Without a checkpoint, nothing is asked.
+"Continue from checkpoint" starts a new session seeded with the handoff and your message. With `autoContinue` on, the question is skipped when the checkpoint saves at least $0.05 (rewrite cost minus seeding the handoff and the message): the governor continues from the checkpoint at once, with no UI needed, and tells you: `Cache expired 23 min ago; continuing from the checkpoint in a new session (~$0.08 instead of ~$1.06).` It is logged as `auto-continue`. A remembered choice and a smaller saving fall back to the question. When the cache expired and no checkpoint exists, a `governor-log` entry records the context size, the idle time and the refreshes since the last request, so a missing protection is visible afterwards. The question is single-flight: inputs that arrive while it is open are held and follow the choice. If the new session is refused or fails, the governor keeps the checkpoint open, tells you the switch failed, and sends your message to the current session. The same holds for rollover, which then reuses the open checkpoint instead of starting another. If `ui.select` throws, it resumes. Either choice is remembered for the session if you tick "don't ask again". Without a checkpoint, nothing is asked.
 
 ### 5. Roll over past a size cap
 
@@ -138,6 +140,8 @@ All settings live in one block in pi's settings, with these defaults:
 | `checkpointMinTokens` | 0 | Optional floor on the context size for a checkpoint; the economic rule decides otherwise |
 | `rolloverTokens` | 200000 | Context size that triggers a rollover; 0 is off |
 | `askOnReturn` | true | Ask between resuming and continuing from the checkpoint |
+| `idleCheckpoint` | true | Take the checkpoint from the governor's own timer when pi's warmer makes no decision |
+| `autoContinue` | false | On return after expiry, continue from the checkpoint without asking when it saves at least $0.05 |
 | `history` | true | Keep the local task history (`governor-history.jsonl` in pi's agent directory) and use it for the brief; false writes and reads nothing |
 | `confirmAbove` | 0 | USD; ask before a prompt whose high estimate exceeds it, and before a task the model estimated above it. 0 is off |
 | `sessionBudget` | 0 | USD; once this session's recorded spend (assistant requests and cache refreshes) reaches it, tool calls ask to continue or are blocked. 0 is off |

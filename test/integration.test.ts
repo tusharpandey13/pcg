@@ -15,7 +15,7 @@ const BIG = "x".repeat(600_000);
 const cleanups: (() => void)[] = [];
 afterEach(() => { vi.useRealTimers(); while (cleanups.length) cleanups.pop()!(); });
 
-async function boot(extra: ((pi: ExtensionAPI) => void)[] = []) {
+async function boot(extra: ((pi: ExtensionAPI) => void)[] = [], over: { warming?: "off" | "idle"; governor?: Record<string, unknown> } = {}) {
 	const cwd = mkdtempSync(join(tmpdir(), "gov-int-"));
 	const faux = registerFauxProvider({ models: [{ id: "f", cost, contextWindow: 1_000_000 }] });
 	const model = { ...faux.getModel(), promptCache: { short: 300 } };
@@ -26,7 +26,7 @@ async function boot(extra: ((pi: ExtensionAPI) => void)[] = []) {
 	await rl.reload();
 	const { session } = await createAgentSession({
 		cwd, agentDir: cwd, modelRuntime: rt, model: rt.getModel(model.provider, model.id)!, resourceLoader: rl,
-		sessionManager: SessionManager.inMemory(), settingsManager: SettingsManager.inMemory({ cacheWarming: "idle", ...{ governor: { prices: { input: 3, cacheWrite: 3.75, cacheRead: 0.3, output: 15 } } } } as never),
+		sessionManager: SessionManager.inMemory(), settingsManager: SettingsManager.inMemory({ cacheWarming: over.warming ?? "idle", governor: { prices: { input: 3, cacheWrite: 3.75, cacheRead: 0.3, output: 15 }, ...over.governor } } as never),
 	});
 	await session.bindExtensions({});
 	cleanups.push(() => { session.dispose(); faux.unregister(); });
@@ -109,4 +109,42 @@ describe("with the real warmer", () => {
 		expect(recs).toHaveLength(2);
 		expect(recs[1]).toMatchObject({ requests: 2, tools: ["estimate_cost"], estimate: { usd: 0.5, steps: 4 } });
 	});
+	it("idle checkpoint: with pi's warmer off, the governor checkpoints in the warm window; a later return continues in a new session", async () => {
+		const { session, faux } = await boot([], { warming: "off", governor: { autoContinue: true } });
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+		faux.setResponses([reply("hi", { cacheWrite: 150_000 })]);
+		await session.prompt(BIG);
+		await session.agent.waitForIdle();
+		faux.setResponses([reply("handoff: state X, next Y", { cacheRead: 150_000 }, 0.05)]);
+		await vi.advanceTimersByTimeAsync(4.6 * 60_000); // before the 5-minute lifetime ends
+		await session.agent.waitForIdle();
+		const users = userTexts(session);
+		expect(users).toHaveLength(2);
+		expect(users[1]).toContain("[governor checkpoint]");
+		expect(branch(session).filter((e: any) => e.type === "custom" && e.customType === "governor-checkpoint" && e.data.open)).toHaveLength(1);
+		expect(branch(session).some((e: any) => e.type === "custom" && e.customType === "governor-log" && /idle checkpoint/.test(e.data.msg))).toBe(true);
+		// Return after the renewed window has expired too: the message continues in a new session from the handoff.
+		const before = faux.getPendingResponseCount();
+		await vi.advanceTimersByTimeAsync(12 * 60_000);
+		await session.prompt("next please");
+		await vi.advanceTimersByTimeAsync(50);
+		const types = branch(session).map((e: any) => e.customType);
+		expect(types).toContain("governor-continue"); // switched without a question
+		expect(userTexts(session)).toHaveLength(2); // the old session got neither the message nor a rewrite
+		expect(before).toBe(0);
+	});
+
+	it("idle checkpoint: stands down when pi's warmer is running (its hook owns the checkpoint)", async () => {
+		const { session, faux } = await boot();
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+		faux.setResponses([reply("hi", { cacheWrite: 150_000 })]);
+		await session.prompt(BIG);
+		await session.agent.waitForIdle();
+		faux.setResponses([reply("", { cacheRead: 150_000 }, 0.0456)]);
+		await vi.advanceTimersByTimeAsync(4.7 * 60_000);
+		await session.agent.waitForIdle();
+		expect(userTexts(session)).toEqual([BIG]); // a refresh, not a checkpoint turn
+		expect(branch(session).some((e: any) => e.type === "custom" && e.customType === "governor-log" && /idle checkpoint/.test(e.data.msg))).toBe(false);
+	});
+
 });
