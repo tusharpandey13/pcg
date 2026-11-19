@@ -22,8 +22,8 @@ pi already has a cache warmer that refreshes the cache before it expires, but it
 | A wake is certain, such as a worker still running that will report back | Keeps warming until the wake arrives, up to the break-even point or pi's 30-minute idle limit |
 | Credentials expired: a refresh gets a 401 or 403, or gets no response at all (for example a credential helper waiting on MFA) | Stops warming instead of retrying every 4.5 minutes, and shows "AWS credentials expired" or "AWS credentials unavailable". The next real request recovers. |
 | Warming is about to stop and a checkpoint pays for itself (about 47K tokens or more at Bedrock Sonnet prices) | Writes a **checkpoint** as a turn inside the session while the cache is warm, at about 0.1× the context |
-| You return after the cache expired and a checkpoint exists | Asks once: resume the full context, or continue from the checkpoint in a fresh session, with dollar estimates for each |
-| The context passes a size cap (200K tokens by default) | Hands off while warm, rolls over to a fresh session, and tells you the per-step read cost before and after |
+| You return after the cache expired and a checkpoint exists | Asks once: resume the full context, or continue from the checkpoint in this session, with dollar estimates for each |
+| The context passes a size cap (200K tokens by default) | Hands off while warm, continues from it in place, and tells you the per-step read cost before and after |
 
 A checkpoint is always a turn inside the warm session. A handoff written by a separate request would read the whole context at the full input price, which is the cost this extension exists to avoid.
 
@@ -105,7 +105,7 @@ Work in pi as usual. pcg only acts when you pause or the context grows.
   ```
   Cache expired 20 min ago. Context: 151K tokens.
     Resume full context  ~$0.38
-    Continue from checkpoint  ~$0.01 (new session, handoff + your message)
+    Continue from checkpoint  ~$0.01 (in this session, handoff + your message)
   ```
   The "don't ask again" variants remember your choice for the session.
 - **With `confirmAbove` set,** a costly prompt asks first:
@@ -125,7 +125,7 @@ Work in pi as usual. pcg only acts when you pause or the context grows.
 ## Limits
 
 - **Warming beyond 30 minutes isn't possible.** pi caps idle warming at 30 minutes, so a longer wait ends in a checkpoint.
-- **The checkpoint estimate is low.** It counts only the handoff, not writing pi's system prompt and tools again in the new session, so the real cost is a few cents more.
+- **The checkpoint estimate is low.** It counts only the handoff, not writing pi's system prompt and tools again after the continue, so the real cost is a few cents more.
 - **Warming stops on the first refresh with no response.** Near a 5-minute lifetime, a missed refresh has probably lost the cache already, and retrying would run your credential helper again, which may mean another MFA prompt each time. A network drop has the same effect. The next real request recovers.
 - **The handoff is only as good as the model's summary.** Continuing from a checkpoint is cheaper but loses detail that the full context would keep.
 - **Not yet confirmed against real Bedrock:**

@@ -109,7 +109,7 @@ describe("with the real warmer", () => {
 		expect(recs).toHaveLength(2);
 		expect(recs[1]).toMatchObject({ requests: 2, tools: ["estimate_cost"], estimate: { usd: 0.5, steps: 4 } });
 	});
-	it("idle checkpoint: with pi's warmer off, the governor checkpoints in the warm window; a later return continues in a new session", async () => {
+	it("idle checkpoint: with pi's warmer off, the governor checkpoints in the warm window; a later return continues from the handoff without a question", async () => {
 		const { session, faux } = await boot([], { warming: "off", governor: { autoContinue: true } });
 		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
 		faux.setResponses([reply("hi", { cacheWrite: 150_000 })]);
@@ -123,7 +123,7 @@ describe("with the real warmer", () => {
 		expect(users[1]).toContain("[governor checkpoint]");
 		expect(branch(session).filter((e: any) => e.type === "custom" && e.customType === "governor-checkpoint" && e.data.open)).toHaveLength(1);
 		expect(branch(session).some((e: any) => e.type === "custom" && e.customType === "governor-log" && /idle checkpoint/.test(e.data.msg))).toBe(true);
-		// Return after the renewed window has expired too: the message continues in a new session from the handoff.
+		// Return after the renewed window has expired too: the message continues from the handoff (this small faux session falls back to a new session: pi will not compact below keepRecentTokens).
 		const before = faux.getPendingResponseCount();
 		await vi.advanceTimersByTimeAsync(12 * 60_000);
 		await session.prompt("next please");

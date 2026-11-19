@@ -814,7 +814,7 @@ describe("real AgentSession and CacheWarmer", () => {
 		t.assertFaux();
 		expect(t.users().filter((u) => u.includes("[governor checkpoint]"))).toHaveLength(1);
 		expect(t.users()).toContain("urgent question");
-		expect(t.notes.filter((n) => /fresh session|new session/i.test(n))).toHaveLength(0);
+		expect(t.notes.filter((n) => /continuing from the checkpoint|new session/i.test(n))).toHaveLength(0);
 		expect(t.faux.getPendingResponseCount()).toBeLessThanOrEqual(2);
 		return t;
 	};
@@ -858,9 +858,32 @@ describe("real AgentSession and CacheWarmer", () => {
 		await vi.advanceTimersByTimeAsync(2000);
 		t.assertFaux();
 		expect(t.newSessions).toHaveLength(1);
-		expect(t.notes.filter((n) => /fresh session/.test(n))).toHaveLength(1);
+		expect(t.notes.filter((n) => /continuing from the checkpoint/i.test(n))).toHaveLength(1);
 		expect(t.users().filter((u) => u.includes("[governor checkpoint]"))).toHaveLength(1);
 		expect(t.faux.state.callCount).toBe(2);
+	});
+
+	it("rollover compacts in place in a real session: no newSession, no switch event, no model call for the summary", async () => {
+		atk();
+		let switches = 0;
+		const t = await bootReal({ extra: [(pi) => void pi.on("session_before_switch", () => void switches++)] }); live.push(t.dispose);
+		t.faux.setResponses(Array.from({ length: 12 }, () => reply("HANDOFF TEXT")));
+		for (const p of ["a", "b", "c"]) await t.session.prompt(p.repeat(300_000));
+		await t.session.prompt("d".repeat(300_000));
+		await vi.advanceTimersByTimeAsync(2000);
+		await t.session.agent.waitForIdle();
+		await vi.advanceTimersByTimeAsync(2000);
+		await t.session.agent.waitForIdle();
+		t.assertFaux();
+		expect(t.newSessions).toHaveLength(0);
+		expect(switches).toBe(0);
+		const comp = t.branch().filter((e) => e.type === "compaction");
+		expect(comp).toHaveLength(1);
+		expect(comp[0].summary).toContain("HANDOFF TEXT");
+		expect(comp[0].fromHook).toBe(true);
+		expect(t.users()).toContain("Continue where you left off.");
+		// Every model request is a real assistant turn: the compaction itself made none.
+		expect(t.faux.state.callCount).toBe(t.branch().filter((e) => e.type === "message" && e.message.role === "assistant").length);
 	});
 
 	it("regression: rollover whose newSession is refused: the user must not be told a switch happened, and no second handoff is paid for", async () => {

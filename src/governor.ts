@@ -385,6 +385,7 @@ export default function governor(pi: ExtensionAPI) {
 	const wakes = new Set<string>();
 	let phase: "idle" | "checkpoint" = "idle"; // "checkpoint": a governor turn is running; never start another
 	let rollover = false;
+	let ours: string | undefined; // summary for the compaction the governor itself started
 	let attempted = false; // one checkpoint attempt per idle period, whatever the outcome
 	let cpFrom = 0; // branch length when the checkpoint turn started: its own messages come after
 	let cpAt = 0;
@@ -835,7 +836,7 @@ export default function governor(pi: ExtensionAPI) {
 		let note: string | undefined;
 		if (!choice && auto) {
 			choice = "continue";
-			note = `Cache expired ${Math.round((Date.now() - touch - ttlOf(ctx)) / MIN)} min ago; continuing from the checkpoint in a new session (~${usd(continueCost)} instead of ~${usd(resumeCost)}).`;
+			note = `Cache expired ${Math.round((Date.now() - touch - ttlOf(ctx)) / MIN)} min ago; continuing from the checkpoint (~${usd(continueCost)} instead of ~${usd(resumeCost)}).`;
 			pi.appendEntry("governor-log", { msg: `auto-continue: ${note}` });
 		}
 		if (!choice && cfg.askOnReturn && ctx.hasUI) {
@@ -845,7 +846,7 @@ export default function governor(pi: ExtensionAPI) {
 			try {
 				picked = await ctx.ui.select(`Cache expired ${ago} min ago. Context: ${k(last.tokens)} tokens.`, [
 					`${CHOICES.resume}  ~${usd(resumeCost)}`,
-					`${CHOICES.continue}  ~${usd(continueCost)} (new session, handoff + your message)`,
+					`${CHOICES.continue}  ~${usd(continueCost)} (in this session, handoff + your message)`,
 					CHOICES.resumeAlways,
 					CHOICES.continueAlways,
 				]);
@@ -920,16 +921,47 @@ export default function governor(pi: ExtensionAPI) {
 		},
 	});
 
-	/** Start a fresh session from the checkpoint. A refused or failed switch keeps the checkpoint open and delivers `user` here. */
+	/**
+	 * Continue from the checkpoint. First in place: compact this session with the checkpoint as the summary (pi makes no model call
+	 * when an extension supplies it) and deliver `user` afterwards. No session switch, so pi's switch guards stay quiet.
+	 * If that fails, start a fresh session; if that fails too, keep the checkpoint open and deliver `user` here.
+	 */
+	const compactInPlace = (ctx: CmdCtx, summary: string) =>
+		new Promise<boolean>((done) => {
+			if (typeof ctx.compact !== "function") return done(false);
+			ours = summary;
+			const end = (ok: boolean) => {
+				ours = undefined;
+				done(ok);
+			};
+			try {
+				ctx.compact({ onComplete: () => end(true), onError: () => end(false) });
+			} catch {
+				end(false);
+			}
+		});
+	// Only a compaction the governor started gets its summary; any other compaction is left to pi.
+	on("session_before_compact", (ev: { reason: string; preparation: { tokensBefore: number }; branchEntries: { id: string }[] }) => {
+		const summary = ours;
+		const last = ev.branchEntries.at(-1)?.id;
+		if (summary === undefined || ev.reason !== "manual" || !last) return;
+		ours = undefined;
+		// Keeping only the newest entry (the handoff reply) leaves nothing old in the context.
+		return { compaction: { summary, firstKeptEntryId: last, tokensBefore: ev.preparation.tokensBefore, estimatedTokensAfter: Math.ceil(summary.length / 4) } };
+	});
 	const freshSession = async (ctx: CmdCtx, note: string, user?: string) => {
 		const cp = checkpoint;
 		if (!cp) return false;
-		const seed =
-			`${SEED_MARK} (${ctx.sessionManager.getSessionFile() ?? "ephemeral"}).\n\n${cp.text}` +
-			(cp.awt ? "\n\nRun `./awt resume` first." : "") +
-			`\n\n${user ?? "Continue where you left off."}`;
+		const from = `(${ctx.sessionManager.getSessionFile() ?? "ephemeral"})`;
+		const handoff = `${cp.text}${cp.awt ? "\n\nRun `./awt resume` first." : ""}`;
+		const next = user ?? "Continue where you left off.";
 		closeCheckpoint();
 		ctx.ui.notify(note, "info");
+		if (await compactInPlace(ctx, `Checkpoint of this session ${from}, taken while the cache was warm.\n\n${handoff}`)) {
+			pi.sendUserMessage(next);
+			return true;
+		}
+		const seed = `${SEED_MARK} ${from}.\n\n${handoff}\n\n${next}`;
 		let ok = false;
 		try {
 			ok = !(await ctx.newSession({
@@ -942,13 +974,13 @@ export default function governor(pi: ExtensionAPI) {
 		if (!ok) {
 			checkpoint = cp;
 			pi.appendEntry("governor-checkpoint", { ...cp, open: true, reopen: true });
-			ctx.ui.notify("The switch to a new session failed; staying in this session.", "warning");
+			ctx.ui.notify("Continuing from the checkpoint failed; staying in this session.", "warning");
 			if (user) pi.sendUserMessage(user);
 		}
 		return ok;
 	};
 	pi.registerCommand("governor-rollover", {
-		description: "Internal: start a fresh session from the checkpoint",
+		description: "Internal: continue from the checkpoint",
 		handler: guard("governor-rollover", (_a: string, ctx: CmdCtx) => {
 			// Per-step read cost before and after: the context now against the handoff alone.
 			const read = pricesOf(ctx.model, cfg.prices).cacheRead;
@@ -960,18 +992,18 @@ export default function governor(pi: ExtensionAPI) {
 			const step = (n: number | undefined) => (n === undefined ? "unknown" : usd((n * read) / 1e6));
 			return freshSession(
 				ctx,
-				`Context passed ${k(cfg.rolloverTokens)} tokens (~${step(tokens)} per step); continuing in a fresh session from the checkpoint (~${step(handoff === undefined || base === undefined || tokens === undefined ? undefined : Math.min(base, tokens) + handoff / 4)} per step).`,
+				`Context passed ${k(cfg.rolloverTokens)} tokens (~${step(tokens)} per step); continuing from the checkpoint (~${step(handoff === undefined || base === undefined || tokens === undefined ? undefined : Math.min(base, tokens) + handoff / 4)} per step).`,
 				held.splice(0).join("\n\n") || undefined,
 			);
 		}) as never,
 	});
 	pi.registerCommand("governor-continue", {
-		description: "Internal: continue your message in a fresh session from the checkpoint",
+		description: "Internal: continue your message from the checkpoint",
 		handler: guard("governor-continue", async (_a: string, ctx: CmdCtx) => {
 			const p = pending;
 			pending = undefined;
 			if (!p || !checkpoint) return;
-			if (await freshSession(ctx, p.note ?? "Continuing from the checkpoint in a new session.", p.text)) pi.appendEntry("governor-continue", { saved: p.saved });
+			if (await freshSession(ctx, p.note ?? "Continuing from the checkpoint.", p.text)) pi.appendEntry("governor-continue", { saved: p.saved });
 		}) as never,
 	});
 

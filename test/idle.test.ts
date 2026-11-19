@@ -88,7 +88,7 @@ describe("automatic return", () => {
 	const expired = () => vi.setSystemTime(T0 + 28 * MIN);
 	const base = (o: object = {}) => setup({ branch: [assistant(T0, 342_000), open({ tokens: 342_000 })], settings: gov({ autoContinue: true }), ...o });
 
-	it("U9 continues in a new session without a question, with the saved cost in the notice", async () => {
+	it("U9 continues from the checkpoint without a question, with the saved cost in the notice", async () => {
 		const g = base();
 		g.fire("session_start");
 		expired();
@@ -96,7 +96,7 @@ describe("automatic return", () => {
 		await vi.advanceTimersByTimeAsync(1);
 		await g.commands.get("governor-continue")!("", g.ctx);
 		expect(g.select).not.toHaveBeenCalled();
-		expect(g.ui.notify.mock.calls.some(([m]) => /Cache expired 23 min ago; continuing from the checkpoint in a new session \(~\$0\.0\d+ instead of ~\$1\.28\)/.test(m))).toBe(true);
+		expect(g.ui.notify.mock.calls.some(([m]) => /Cache expired 23 min ago; continuing from the checkpoint \(~\$0\.0\d+ instead of ~\$1\.28\)/.test(m))).toBe(true);
 		expect(g.sent.at(-1)!.text).toMatch(/^\[new\] .*HANDOFF.*next please$/s);
 		expect(logs(g).some((m) => m.startsWith("auto-continue:"))).toBe(true);
 	});

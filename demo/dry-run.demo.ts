@@ -11,7 +11,7 @@ import governor, { expectWake } from "../src/governor.ts";
 // Sonnet 5.5 first-party prices, $/MTok. Usage numbers below are scripted, so the dollar figures are illustrative.
 const cost = { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 };
 const MID = "x".repeat(600_000); // faux counts 4 chars per token: about 150K tokens
-const BIG = "x".repeat(960_000); // about 240K tokens, over the 200K rollover cap
+const HALF_BIG = "x".repeat(480_000); // two of these are about 240K tokens, over the 200K rollover cap
 const lines: string[] = [];
 let t0 = 0;
 const at = () => `${String(Math.round((Date.now() - t0) / 60_000)).padStart(3)} min`;
@@ -29,6 +29,8 @@ async function boot(answer: string) {
 	const watch = (p: ExtensionAPI) => {
 		pi = p;
 		p.on("cache_warming_decision", (e) => void log("warmer", `refresh? pi says ${e.action} (costs $${e.warmCost.toFixed(3)}, a miss would cost $${e.missCost.toFixed(2)})`));
+		p.on("session_before_switch", () => void log("pi", "session switch (guards would prompt here)"));
+		p.on("session_compact", (e) => void log("pi", `compacted in place, summary from the governor: ${e.compactionEntry.summary.slice(0, 80).replace(/\n/g, " ")}…`));
 		p.on("after_provider_response", () => void log("request", "model request sent"));
 	};
 	const rl = new DefaultResourceLoader({ cwd, agentDir: cwd, extensionFactories: [governor, watch] });
@@ -102,9 +104,10 @@ it("dry run", async () => {
 	lines.push("", "## Scenario 3: the session grows past the 200K rollover cap");
 	t0 = Date.now();
 	s = await boot("Resume full context");
-	s.faux.setResponses([reply("Big refactor step done.", { cacheWrite: 240_000 }), reply("Handoff: refactor at step 3 of 5; next: migrate call sites in api/.", { cacheRead: 240_000 })]);
-	log("you", "a long working turn (context ~240K)");
-	await s.session.prompt(BIG);
+	s.faux.setResponses([reply("Step 1 done.", { cacheWrite: 120_000 }), reply("Big refactor step done.", { cacheRead: 120_000, cacheWrite: 120_000 }), reply("Handoff: refactor at step 3 of 5; next: migrate call sites in api/.", { cacheRead: 240_000 })]);
+	log("you", "long working turns (context ~240K)");
+	await s.session.prompt(HALF_BIG);
+	await s.session.prompt(HALF_BIG);
 	await vi.advanceTimersByTimeAsync(2000);
 	await s.session.agent.waitForIdle();
 	await vi.advanceTimersByTimeAsync(2000);

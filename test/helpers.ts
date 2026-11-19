@@ -18,7 +18,7 @@ export const warm = (ts: number, cost = 0.05) => ({
 export const custom = (customType: string, data: unknown, ts = T0) => ({ type: "custom", customType, data, id: `e${n++}`, parentId: null, timestamp: new Date(ts).toISOString() });
 
 /** Minimal pi + ctx mocks: enough to drive the extension's handlers by hand. */
-export function setup(opts: { settings?: any; branch?: any[]; hasUI?: boolean; cwd?: string; select?: string | undefined; confirm?: boolean } = {}) {
+export function setup(opts: { settings?: any; branch?: any[]; hasUI?: boolean; cwd?: string; select?: string | undefined; confirm?: boolean; compact?: "ok" | "error" | "foreign" } = {}) {
 	const handlers = new Map<string, (e: any, c: any) => any>();
 	const commands = new Map<string, (a: string, c: any) => any>();
 	const tools = new Map<string, any>();
@@ -30,10 +30,23 @@ export function setup(opts: { settings?: any; branch?: any[]; hasUI?: boolean; c
 	const select = vi.fn(async (_t: string, _o: string[]) => opts.select);
 	const confirm = vi.fn(async (_t: string, _m: string) => opts.confirm ?? true);
 	const setEditorText = vi.fn();
+	/** Models pi's compact(): fires session_before_compact, and uses the extension's summary or reports an error. No model call exists here. */
+	const compactions: any[] = [];
+	const compact = vi.fn((o: any) => {
+		void (async () => {
+			if (opts.compact === "error") return o.onError?.(new Error("Nothing to compact"));
+			const last = branch.at(-1);
+			const r = await handlers.get("session_before_compact")?.({ type: "session_before_compact", reason: "manual", willRetry: false, preparation: { tokensBefore: 342_000 }, branchEntries: [...branch], signal: new AbortController().signal }, ctx);
+			if (!r?.compaction) return o.onError?.(new Error("pi would call the model here"));
+			compactions.push(r.compaction);
+			branch.push({ type: "compaction", id: `c${compactions.length}`, parentId: last?.id ?? null, ...r.compaction });
+			o.onComplete?.(r.compaction);
+		})();
+	});
 	const ui = { setStatus: vi.fn(), notify: vi.fn(), select, confirm, setEditorText };
 	const ctx: any = {
 		ui, hasUI: opts.hasUI ?? true, cwd: opts.cwd ?? "/nonexistent", model: { provider: "p", id: "m", promptCache: { short: 300 } },
-		isIdle: () => true, newSession,
+		isIdle: () => true, newSession, ...(opts.compact ? { compact } : {}),
 		sessionManager: { getBranch: () => [...branch], getSessionFile: () => "/s/old.jsonl" },
 	};
 	const pi: any = {
@@ -47,5 +60,5 @@ export function setup(opts: { settings?: any; branch?: any[]; hasUI?: boolean; c
 	};
 	governor(pi);
 	const fire = (ev: string, e: any = {}) => handlers.get(ev)!(e, ctx);
-	return { pi, ctx, fire, commands, tools, sent, entries, branch, ui, select, confirm, setEditorText, newSession };
+	return { pi, ctx, fire, commands, tools, sent, entries, branch, ui, select, confirm, setEditorText, newSession, compact, compactions };
 }

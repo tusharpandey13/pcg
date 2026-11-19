@@ -49,7 +49,7 @@ When warming is about to stop and a checkpoint pays for itself, the governor wri
 A checkpoint pays when `CHECKPOINT_USE_CHANCE * saving >= cost`, with prices from the model:
 
 - cost = `2 * tokens * cacheRead + 1000 * output`: two requests (write the handoff, reply) that read the context, plus about 1000 output tokens (a handoff under 300 words, written and echoed, plus the tool call).
-- saving = `(tokens - 1000) * writePrice`: the rewrite avoided, minus seeding the handoff into the new session. `writePrice` is the cache-write price, or input when the model has none.
+- saving = `(tokens - 1000) * writePrice`: the rewrite avoided, minus seeding the handoff as the new context. `writePrice` is the cache-write price, or input when the model has none.
 - `CHECKPOINT_USE_CHANCE = 0.25` is a prior, not measured.
 
 At Bedrock Sonnet prices (input 3, write 3.75, read 0.3, output 15) this crosses at about 47K tokens. `checkpointMinTokens` is an optional floor on top (default 0): the economics decide. The recorded cost of a checkpoint is the sum of all its requests, so the constants can be checked against real checkpoints. It does this as a turn inside the session, so the turn reads the cached context at 0.1x and writes a short handoff, typically 1-3K output tokens.
@@ -67,7 +67,7 @@ The handoff is taken only from the checkpoint turn's own assistant message (mess
 
 A user message that arrives while the checkpoint turn runs is held and sent when the turn settles, with the notice "Saving handoff, your message follows". It is never steered into the checkpoint turn.
 
-This adds one turn to the old session's history. The old session is not reused after a fresh start, so that does not matter.
+This adds one turn to the session's history. The continue replaces that history with the handoff, so it does not matter.
 
 ### 4. Choose on return
 
@@ -76,16 +76,16 @@ When you send a message, the governor checks whether the cache has expired (time
 ```
 Cache expired 23 min ago. Context: 342K tokens.
   Resume full context     ~$1.06
-  Continue from checkpoint ~$0.08 (new session, handoff + your message)
+  Continue from checkpoint ~$0.08 (in this session, handoff + your message)
 ```
 
-"Continue from checkpoint" starts a new session seeded with the handoff and your message. With `autoContinue` on, the question is skipped when the checkpoint saves at least $0.05 (rewrite cost minus seeding the handoff and the message): the governor continues from the checkpoint at once, with no UI needed, and tells you: `Cache expired 23 min ago; continuing from the checkpoint in a new session (~$0.08 instead of ~$1.06).` It is logged as `auto-continue`. A remembered choice and a smaller saving fall back to the question. When the cache expired and no checkpoint exists, a `governor-log` entry records the context size, the idle time and the refreshes since the last request, so a missing protection is visible afterwards. The question is single-flight: inputs that arrive while it is open are held and follow the choice. If the new session is refused or fails, the governor keeps the checkpoint open, tells you the switch failed, and sends your message to the current session. The same holds for rollover, which then reuses the open checkpoint instead of starting another. If `ui.select` throws, it resumes. Either choice is remembered for the session if you tick "don't ask again". Without a checkpoint, nothing is asked.
+"Continue from checkpoint" continues in this session. The governor calls `ctx.compact()` and answers its own `session_before_compact` with the handoff as the summary, keeping only the newest entry, so pi makes no model call and the context becomes the handoff. Then your message is sent. Only a compaction the governor started (manual reason, flag set) gets this summary; any other compaction is left to pi. No session switch happens, so pi's switch guards (for example an uncommitted-changes check or a "clear session?" confirmation) do not fire. If compaction errors or is cancelled (pi refuses to compact a context smaller than `compaction.keepRecentTokens`, default 20K), the governor falls back to a new session seeded with the handoff and your message, and if that fails it stays in the session. With `autoContinue` on, the question is skipped when the checkpoint saves at least $0.05 (rewrite cost minus seeding the handoff and the message): the governor continues from the checkpoint at once, with no UI needed, and tells you: `Cache expired 23 min ago; continuing from the checkpoint (~$0.08 instead of ~$1.06).` It is logged as `auto-continue`. A remembered choice and a smaller saving fall back to the question. When the cache expired and no checkpoint exists, a `governor-log` entry records the context size, the idle time and the refreshes since the last request, so a missing protection is visible afterwards. The question is single-flight: inputs that arrive while it is open are held and follow the choice. If both the compaction and the new session fail, the governor keeps the checkpoint open, tells you the switch failed, and sends your message to the current session. The same holds for rollover, which then reuses the open checkpoint instead of starting another. If `ui.select` throws, it resumes. Either choice is remembered for the session if you tick "don't ask again". Without a checkpoint, nothing is asked.
 
 ### 5. Roll over past a size cap
 
-When a run settles and the context is above the cap (default 200K tokens), the governor does the same in-session handoff while warm, then starts a fresh session from it, and tells you. This bounds the cost of every later turn and of any later rewrite. The cap is configurable, and `0` turns rollover off.
+When a run settles and the context is above the cap (default 200K tokens), the governor does the same in-session handoff while warm, then continues from it in place, the same way, and tells you. Nothing in rollover needs a new session: the point is a small context, which the compaction gives. This bounds the cost of every later turn and of any later rewrite. The cap is configurable, and `0` turns rollover off.
 
-The cap stays a size, not a price. Cost alone says to roll over almost at once, because a smaller context always costs less per step; the real limit is summary quality, which the estimator cannot price. The notice shows what the move buys, as the read cost per step before and after: `Context passed 200K tokens (~$0.06 per step); continuing in a fresh session from the checkpoint (~$0.01 per step).` Before is the last context size x cacheRead; after is this session's first request (system prompt, tools, first prompt) plus the handoff length / 4, x cacheRead, at the model's prices.
+The cap stays a size, not a price. Cost alone says to roll over almost at once, because a smaller context always costs less per step; the real limit is summary quality, which the estimator cannot price. The notice shows what the move buys, as the read cost per step before and after: `Context passed 200K tokens (~$0.06 per step); continuing from the checkpoint (~$0.01 per step).` Before is the last context size x cacheRead; after is this session's first request (system prompt, tools, first prompt) plus the handoff length / 4, x cacheRead, at the model's prices.
 
 ### 6. Workers with a mailbox (phase 2)
 
@@ -168,5 +168,5 @@ All settings live in one block in pi's settings, with these defaults:
 
 - No new interface: pi's TUI is the interface.
 - No changes to Claude Code, settings policy or gateways.
-- No automatic switch to a fresh session without telling the user.
+- No automatic change of context (compaction or a fresh session) without telling the user.
 - No model-written summaries outside the warm session, since those read the context at full price.
