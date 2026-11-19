@@ -55,7 +55,7 @@ In the `input` hook, after the existing expiry test and with a checkpoint open:
 ```
 saved = resumeCost - continueCost
 if no remembered choice and cfg.autoContinue and saved >= 0.05:
-    choice = continue; note = "Cache expired N min ago; continuing from the checkpoint in a new session (~$A instead of ~$B)."
+    choice = continue; note = "Cache expired N min ago; continuing from the checkpoint (~$A instead of ~$B)."
 ```
 
 - No UI is needed, so the path also works in print/json mode.
