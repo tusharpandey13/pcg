@@ -46,6 +46,8 @@ To update pcg to the latest `main` (plain `pi update` updates pi only, not exten
 pi update git:github.com/tusharpandey13/pcg
 ```
 
+The source must match the one `pi list` shows. An install from a local checkout updates with `git pull` in that checkout instead.
+
 pcg reads its settings when a session starts, so start a new pi session after updating.
 
 ## Setup
