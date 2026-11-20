@@ -312,7 +312,7 @@ describe("feature 4: choose on return", () => {
 		expect(none.select).not.toHaveBeenCalled();
 	});
 	it("defaults to resume and logs without UI, or when askOnReturn is off", async () => {
-		for (const o of [{ hasUI: false }, { settings: { governor: { askOnReturn: false } } }]) {
+		for (const o of [{ hasUI: false }, { settings: { governor: { askOnReturn: false, autoContinue: false } } }]) {
 			const g = setup({ branch: [assistant(T0, 342_000), open()], ...o });
 			g.fire("session_start");
 			expired();

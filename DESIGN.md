@@ -139,9 +139,9 @@ All settings live in one block in pi's settings, with these defaults:
 |---|---|---|
 | `checkpointMinTokens` | 0 | Optional floor on the context size for a checkpoint; the economic rule decides otherwise |
 | `rolloverTokens` | 200000 | Context size that triggers a rollover; 0 is off |
-| `askOnReturn` | true | Ask between resuming and continuing from the checkpoint |
+| `askOnReturn` | false | Ask between resuming and continuing from the checkpoint. Off by default; the return continues without a question |
 | `idleCheckpoint` | true | Take the checkpoint from the governor's own timer when pi's warmer makes no decision |
-| `autoContinue` | false | On return after expiry, continue from the checkpoint without asking when it saves at least $0.05 |
+| `autoContinue` | true | On return after expiry, continue from the checkpoint without asking when it saves at least $0.05. A smaller saving resumes the full context |
 | `history` | true | Keep the local task history (`governor-history.jsonl` in pi's agent directory) and use it for the brief; false writes and reads nothing |
 | `confirmAbove` | 0 | USD; ask before a prompt whose high estimate exceeds it, and before a task the model estimated above it. 0 is off |
 | `sessionBudget` | 0 | USD; once this session's recorded spend (assistant requests and cache refreshes) reaches it, tool calls ask to continue or are blocked. 0 is off |

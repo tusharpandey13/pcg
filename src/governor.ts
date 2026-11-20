@@ -29,9 +29,9 @@ export interface GovernorConfig {
 export const DEFAULTS: GovernorConfig = {
 	checkpointMinTokens: 0, // an optional floor: checkpointPays decides
 	rolloverTokens: 200_000,
-	askOnReturn: true,
+	askOnReturn: false, // owner 20-Nov-2026: no return question by default
 	idleCheckpoint: true,
-	autoContinue: false,
+	autoContinue: true,
 	history: true,
 	confirmAbove: 0,
 	sessionBudget: 0,

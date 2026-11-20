@@ -164,9 +164,28 @@ describe("evidence and config", () => {
 		expect(logs(small)).toEqual([]);
 		expect(logs(warm)).toEqual([]);
 	});
+	it("default config: an expired return never asks; big saving continues, small saving resumes", async () => {
+		const defaults = { settings: {} };
+		const big = setup({ branch: [assistant(T0, 342_000), open({ tokens: 342_000 })], ...defaults, select: "Resume full context" });
+		big.fire("session_start");
+		vi.setSystemTime(T0 + 28 * MIN);
+		expect(await big.fire("input", { source: "interactive", text: "next please" })).toEqual({ action: "handled" });
+		await vi.advanceTimersByTimeAsync(1);
+		await big.commands.get("governor-continue")!("", big.ctx);
+		expect(big.select).not.toHaveBeenCalled();
+		expect(big.sent.at(-1)!.text).toMatch(/^\[new\] .*next please$/s);
+		vi.setSystemTime(T0);
+		const small = setup({ branch: [assistant(T0, 8_000), open({ tokens: 8_000 })], ...defaults, select: "Resume full context" });
+		small.fire("session_start");
+		vi.setSystemTime(T0 + 28 * MIN);
+		expect(await small.fire("input", { source: "interactive", text: "next please" })).toBeUndefined();
+		expect(small.select).not.toHaveBeenCalled();
+		expect(small.entries.map((e) => e.type)).toContain("governor-log");
+	});
 	it("loadConfig defaults and ignores wrong types", () => {
-		expect(DEFAULTS).toMatchObject({ idleCheckpoint: true, autoContinue: false });
-		expect(loadConfig({ governor: { idleCheckpoint: "yes", autoContinue: 1 } })).toMatchObject({ idleCheckpoint: true, autoContinue: false });
+		expect(DEFAULTS).toMatchObject({ idleCheckpoint: true, autoContinue: true, askOnReturn: false });
+		expect(loadConfig({ governor: { idleCheckpoint: "yes", autoContinue: 1, askOnReturn: "yes" } })).toMatchObject({ idleCheckpoint: true, autoContinue: true, askOnReturn: false });
+		expect(loadConfig({})).toMatchObject({ askOnReturn: false, autoContinue: true });
 		expect(loadConfig({ governor: { idleCheckpoint: false, autoContinue: true } })).toMatchObject({ idleCheckpoint: false, autoContinue: true });
 	});
 });

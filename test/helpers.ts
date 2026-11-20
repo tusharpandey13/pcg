@@ -1,8 +1,8 @@
 import { vi } from "vitest";
 import governor from "../src/governor.ts";
 
-/** Tests pin their own prices so their expected dollar figures do not depend on the shipped defaults. */
-export const TEST_SETTINGS = { governor: { prices: { input: 3, cacheWrite: 3.75, cacheRead: 0.3, output: 15 } } };
+/** Tests pin their own prices and the question path (askOnReturn on, autoContinue off), so their expected dollar figures do not depend on the shipped defaults. */
+export const TEST_SETTINGS = { governor: { askOnReturn: true, autoContinue: false, prices: { input: 3, cacheWrite: 3.75, cacheRead: 0.3, output: 15 } } };
 export const T0 = Date.UTC(2026, 0, 1, 12, 0, 0);
 export const usage = (o: Partial<Record<"input" | "cacheRead" | "cacheWrite", number>> = {}, cost = 0) => ({
 	input: 0, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: cost }, ...o,

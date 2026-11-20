@@ -18,7 +18,7 @@ Rewrites are about a third of all spend on these sessions, and the avoidable one
 Goals
 
 1. A checkpoint exists before the cache expires, whether or not pi's warmer runs.
-2. On return after expiry, the user can get the cheap path without answering a question (opt-in).
+2. On return after expiry, the user can get the cheap path without answering a question (the default since 0.2.0).
 3. Nothing is silent: every automatic switch is announced, logged and carries the saved cost.
 4. Every skipped protection leaves evidence in the session log, so the next failure can be diagnosed.
 
@@ -31,9 +31,9 @@ Non-goals: finding why the warmer does not run (the log from goal 4 will say), c
 | Setting | Default | Meaning |
 |---|---|---|
 | `idleCheckpoint` | `true` | Take the checkpoint from the governor's own timer when pi's warmer makes no decision |
-| `autoContinue` | `false` | On return after expiry with a checkpoint, continue from it without asking when it saves at least $0.05 |
+| `autoContinue` | `true` | On return after expiry with a checkpoint, continue from it without asking when it saves at least $0.05 |
 
-Both are read with the existing `loadConfig` rules (a wrong type falls back to the default). `askOnReturn` is unchanged. `autoContinue` takes precedence over it when its saving condition holds; otherwise `askOnReturn` applies as before.
+Both are read with the existing `loadConfig` rules (a wrong type falls back to the default). `askOnReturn` now defaults to `false` (0.2.0). `autoContinue` takes precedence over it when its saving condition holds. Otherwise `askOnReturn` applies: off resumes the full context and logs; on asks.
 
 Measured reason for each: `idleCheckpoint` fixes 41 of 42 unprotected rewrites; `autoContinue` removes the question that costs a round trip of attention on every return, and is needed where the user is not watching the session.
 
@@ -111,7 +111,7 @@ End to end (`test/integration.test.ts`: real `AgentSession`, real `CacheWarmer`,
 |---|---|---|
 | E1 | `cacheWarming: "off"`, 150K-token context, idle 4.7 min | A checkpoint turn ran in the session, its cost recorded, cache entries show a read |
 | E2 | Then the user returns at 12 min with `autoContinue` | A new session whose first user message holds the handoff and the user's text; the old session got no further request |
-| E3 | Same with `autoContinue: false` and a scripted `select` | The question appears once with both prices |
+| E3 | Same with `askOnReturn: true, autoContinue: false` and a scripted `select` | The question appears once with both prices |
 | E4 | `cacheWarming: "idle"`, warmer running | The watchdog never fires, the hook checkpoints once at the last slot (existing behaviour) |
 | E5 | Return at 2 min | No checkpoint, no switch |
 
@@ -124,8 +124,8 @@ Manual check on the host (maintainer only, real model, a few cents): work two tu
 1. Works in a large session. The run ends.
 2. About 4.6 minutes later a short turn appears ("Record where things stand…"). It costs a few cents and also renews the cache. The user can ignore it.
 3. Back within the renewed window: the next message is a normal warm turn.
-4. Back later (cache cold), `autoContinue` off: a question card shows both prices, resume or continue. One tap.
-5. Back later, `autoContinue` on: the message goes straight into a new session. A notice states the time away and the saved cost; the seed message shows the handoff.
+4. Back later (cache cold), `askOnReturn` on and `autoContinue` off: a question card shows both prices, resume or continue. One tap.
+5. Back later, default settings: the message goes straight into a new session. A notice states the time away and the saved cost; the seed message shows the handoff.
 6. If the switch fails: a warning, and the message goes to the old session (the expensive path, but nothing is lost).
 
 ### 5.2 Agent
@@ -145,6 +145,6 @@ Manual check on the host (maintainer only, real model, a few cents): work two tu
 
 ## 6. Rollout
 
-1. Land `idleCheckpoint` (on) and `autoContinue` (off) with tests and the `DESIGN.md` update in one commit.
-2. The maintainer turns `autoContinue` on in one session, compares the next week's cold-rewrite cost in `governor-history.jsonl` and the evidence entries.
+1. Land `idleCheckpoint` (on) and `autoContinue` (on, with `askOnReturn` off from 0.2.0) with tests and the `DESIGN.md` update in one commit.
+2. The maintainer compares the next week's cold-rewrite cost in `governor-history.jsonl` and the evidence entries.
 3. If the watchdog fires in sessions where the warmer also ran, the delay is wrong; adjust `0.92`.
