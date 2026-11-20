@@ -40,6 +40,14 @@ pi install git:github.com/tusharpandey13/pcg
 
 pi loads TypeScript directly, so there is no build step, and pcg has no runtime dependencies.
 
+To update pcg to the latest `main` (plain `pi update` updates pi only, not extensions):
+
+```bash
+pi update git:github.com/tusharpandey13/pcg
+```
+
+pcg reads its settings when a session starts, so start a new pi session after updating.
+
 ## Setup
 
 1. **Credentials.** Either route works, because pi uses the standard AWS credential chain:
