@@ -29,6 +29,8 @@ A checkpoint is always a turn inside the warm session. A handoff written by a se
 
 If the task directory has [`awt`](https://github.com/tusharpandey13/awt), the checkpoint goes into it (`./awt state`). Otherwise it goes to `.pi-governor/handoff.md`.
 
+The checkpoint turn shows in a chat client as a user message and a long reply. In Paseo, the optional plugin in [`paseo-plugin/`](paseo-plugin/README.md) hides the prompt and folds the reply into one quiet row. The reply starts with the line `[pcg handoff]`, which pcg strips before it stores the handoff.
+
 ## Install
 
 Needs pi 1.5.0 or later (Node 22.19+).

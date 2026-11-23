@@ -2,7 +2,7 @@ import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { breakEvenRefreshes, buildReport, checkpointPays, DEFAULTS, expectWake, loadConfig, returnChance } from "../src/governor.ts";
+import { breakEvenRefreshes, buildReport, checkpointPays, checkpointPrompt, DEFAULTS, expectWake, HANDOFF_MARK, loadConfig, returnChance, stripHandoffMark } from "../src/governor.ts";
 import { assistant, custom, setup, T0, warm } from "./helpers.ts";
 
 const MIN = 60_000;
@@ -241,6 +241,29 @@ describe("feature 5: rollover", () => {
 		expect(g.newSession).toHaveBeenCalledOnce();
 		expect(g.sent.at(-1)!.text).toMatch(/^\[new\] .*ROLL HANDOFF/s);
 		expect(g.entries.at(-1)).toEqual({ type: "governor-checkpoint", data: { open: false } });
+	});
+	it("asks for the handoff marker, and stores and seeds the handoff without it", async () => {
+		expect(HANDOFF_MARK).toBe("[pcg handoff]");
+		for (const awt of [false, true]) expect(checkpointPrompt(awt)).toContain(`start the reply with the exact line ${HANDOFF_MARK}`);
+		const g = setup({ branch: big(250_000) });
+		g.fire("session_start");
+		g.fire("agent_settled", { aborted: false });
+		expect(g.sent[0].text).toContain(HANDOFF_MARK);
+		g.branch.push(assistant(T0 + 1000, 250_000, "[pcg handoff]\n\nMARKED HANDOFF"));
+		g.fire("agent_settled", { aborted: false });
+		await vi.advanceTimersByTimeAsync(1);
+		const stored = g.entries.find((e) => e.type === "governor-checkpoint") as { data: { text: string } };
+		expect(stored.data.text).toBe("MARKED HANDOFF");
+		await g.commands.get("governor-rollover")!("", g.ctx);
+		const seed = g.sent.at(-1)!.text;
+		expect(seed).toContain("MARKED HANDOFF");
+		expect(seed).not.toContain(HANDOFF_MARK);
+	});
+	it("strips only a leading marker; a reply without one is kept as it is", () => {
+		expect(stripHandoffMark("[pcg handoff]\n  goal: x")).toBe("goal: x");
+		expect(stripHandoffMark("  [pcg handoff] goal: x")).toBe("goal: x");
+		expect(stripHandoffMark("goal: x")).toBe("goal: x");
+		expect(stripHandoffMark("goal: [pcg handoff] x")).toBe("goal: [pcg handoff] x");
 	});
 	it("does nothing at or below the cap, when 0, when aborted, or while a wake is expected", () => {
 		for (const [tokens, cfg, ev, wake] of [[200_000, {}, {}, false], [900_000, { rolloverTokens: 0 }, {}, false], [250_000, {}, { aborted: true }, false], [250_000, {}, {}, true]] as const) {

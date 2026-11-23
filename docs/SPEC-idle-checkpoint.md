@@ -130,7 +130,7 @@ Manual check on the host (maintainer only, real model, a few cents): work two tu
 
 ### 5.2 Agent
 
-- During the checkpoint turn the agent sees the standard checkpoint prompt and runs `./awt state --now … --next …` when `awt` exists, otherwise writes `.pi-governor/handoff.md`. It answers with the handoff.
+- During the checkpoint turn the agent sees the standard checkpoint prompt and runs `./awt state --now … --next …` when `awt` exists, otherwise writes `.pi-governor/handoff.md`. It answers with the handoff, starting with the line `[pcg handoff]`, which the governor strips before storing it.
 - In the new session its first message is the seed: the handoff, the pointer to the previous session file, "Run `./awt resume` first" when `awt` is present, then the user's message. It has no earlier conversation and must work from that.
 - The agent is told nothing about prices.
 

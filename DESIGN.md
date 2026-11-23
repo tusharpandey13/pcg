@@ -56,6 +56,7 @@ At Bedrock Sonnet prices (input 3, write 3.75, read 0.3, output 15) this crosses
 
 - With `./awt` in the task directory, the turn runs `./awt state --now ... --next ...` and updates refs and decisions as needed.
 - Without it, the turn writes `.pi-governor/handoff.md`.
+- The prompt asks the agent to start its reply with the exact line `[pcg handoff]` (`HANDOFF_MARK`). A client plugin (`paseo-plugin/`) uses it to draw the long reply as one quiet row. The governor strips a leading marker and the whitespace after it before it stores the handoff (and when it rebuilds a stored checkpoint), so the stored and seeded handoff never contains it. A reply without the marker is stored as it is.
 
 A checkpoint costs about 0.2x the context plus output (two reads). That is worth paying only when the cache will probably expire before you return, which is exactly when warming stops.
 

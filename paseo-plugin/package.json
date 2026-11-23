@@ -1,0 +1,22 @@
+{
+  "name": "pcg-paseo-plugin",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Paseo client plugin that quiets pcg's checkpoint turn in the chat",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsc --noEmit && node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@getpaseo/plugin": "0.16.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "~19.2.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.9.3"
+  }
+}

@@ -351,12 +351,19 @@ const CHECKPOINT_MARK = "[governor checkpoint]";
 const SEED_MARK = "Continuing from a checkpoint of the previous session";
 /** Prompts the governor sent itself: no brief, no task. */
 const isOwnPrompt = (t: string) => t.startsWith(CHECKPOINT_MARK) || t.startsWith(SEED_MARK);
+/** The first line of the checkpoint reply. A Paseo plugin (paseo-plugin/) folds a reply that starts with it into one quiet row. */
+export const HANDOFF_MARK = "[pcg handoff]";
+/** The handoff without the marker and the whitespace after it. A reply without the marker is returned as it is. */
+export const stripHandoffMark = (t: string): string => {
+	const s = t.trimStart();
+	return s.startsWith(HANDOFF_MARK) ? s.slice(HANDOFF_MARK.length).trimStart() : t;
+};
 export const checkpointPrompt = (awt: boolean): string =>
 	CHECKPOINT_MARK + " The session may go idle and its cache expire. Do nothing else. " +
 	(awt
 		? 'Run `./awt state --now "<what you are doing>" --next "<next steps>"` and update refs and decisions as needed. '
 		: `Write a handoff to ${HANDOFF_FILE} (create the directory): goal, state, decisions, files, next steps. `) +
-	"Then reply with that handoff in under 300 words.";
+	`Then reply with that handoff in under 300 words, and start the reply with the exact line ${HANDOFF_MARK}`;
 
 const EXPIRED = "AWS credentials expired";
 const NO_RESPONSE = "AWS credentials unavailable";
@@ -539,7 +546,7 @@ export default function governor(pi: ExtensionAPI) {
 		for (const e of ctx.sessionManager.getBranch().reverse()) {
 			if (e.type !== "custom" || e.customType !== "governor-checkpoint") continue;
 			const d = e.data as (Checkpoint & { open: boolean }) | undefined;
-			if (d?.open && typeof d.text === "string" && d.text) checkpoint = { text: d.text, tokens: fin(d.tokens) ?? 0, awt: d.awt === true };
+			if (d?.open && typeof d.text === "string" && d.text) checkpoint = { text: stripHandoffMark(d.text) || d.text, tokens: fin(d.tokens) ?? 0, awt: d.awt === true };
 			break;
 		}
 	});
@@ -753,7 +760,7 @@ export default function governor(pi: ExtensionAPI) {
 			const last = branch.slice(cpFrom).map(asMsg).filter((m): m is Msg => !!m).at(-1);
 			if (ev.aborted || !last || last.stopReason === "error" || last.stopReason === "aborted") return release();
 			const awt = hasAwt(ctx.cwd);
-			const text = (!awt && readHandoff(ctx)) || textOf(last);
+			const text = stripHandoffMark((!awt && readHandoff(ctx)) || textOf(last));
 			checkpoint = { text, tokens: tokensOf(last) ?? 0, awt };
 			pi.appendEntry("governor-checkpoint", { ...checkpoint, open: true, rollover: wasRollover, cost: branch.slice(cpFrom).reduce((sum, e) => sum + (fin(asMsg(e)?.usage?.cost?.total) ?? 0), 0) });
 			if (wasRollover) later(() => runCommand("governor-rollover"));

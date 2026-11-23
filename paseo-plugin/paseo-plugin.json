@@ -1,0 +1,7 @@
+{
+  "id": "pcg",
+  "name": "pcg",
+  "description": "Quiets pcg's checkpoint turn: hides the checkpoint prompt and folds the handoff reply into one grey row",
+  "media": [],
+  "requirements": { "paseo": ">=0.16.1" }
+}
