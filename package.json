@@ -1,6 +1,6 @@
 {
   "name": "pcg",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "type": "module",
   "description": "pcg (pi cache governor): a pi extension that cuts prompt-cache costs on long Claude sessions with a short, fixed cache lifetime",

@@ -359,11 +359,14 @@ export const stripHandoffMark = (t: string): string => {
 	return s.startsWith(HANDOFF_MARK) ? s.slice(HANDOFF_MARK.length).trimStart() : t;
 };
 export const checkpointPrompt = (awt: boolean): string =>
-	CHECKPOINT_MARK + " The session may go idle and its cache expire. Do nothing else. " +
+	CHECKPOINT_MARK + " Maintenance turn from pcg, not a message from the owner. The session may go idle and its cache expire. For this turn only: save state and start no work. " +
 	(awt
-		? 'Run `./awt state --now "<what you are doing>" --next "<next steps>"` and update refs and decisions as needed. '
-		: `Write a handoff to ${HANDOFF_FILE} (create the directory): goal, state, decisions, files, next steps. `) +
-	`Then reply with that handoff in under 300 words, and start the reply with the exact line ${HANDOFF_MARK}`;
+		? 'Run `./awt state --now "<what you are doing>" --next "<the owner\'s pending next steps>"` and update refs and decisions as needed. '
+		: `Write a handoff to ${HANDOFF_FILE} (create the directory): goal (the owner's last real request), state, decisions, files, next steps (the owner's pending steps). `) +
+	`Then reply with that handoff in under 300 words, and start the reply with the exact line ${HANDOFF_MARK}. ` +
+	"This is not a new task and does not change the task; its limits end with that reply.";
+/** Heads the summary and the seed after continuing from a checkpoint (pcic R57). */
+export const AFTER_CHECKPOINT = "The checkpoint's limits have ended; it was not the task. Continue the owner's last request.";
 
 const EXPIRED = "AWS credentials expired";
 const NO_RESPONSE = "AWS credentials unavailable";
@@ -964,11 +967,11 @@ export default function governor(pi: ExtensionAPI) {
 		const next = user ?? "Continue where you left off.";
 		closeCheckpoint();
 		ctx.ui.notify(note, "info");
-		if (await compactInPlace(ctx, `Checkpoint of this session ${from}, taken while the cache was warm.\n\n${handoff}`)) {
+		if (await compactInPlace(ctx, `Checkpoint of this session ${from}, taken while the cache was warm. ${AFTER_CHECKPOINT}\n\n${handoff}`)) {
 			pi.sendUserMessage(next);
 			return true;
 		}
-		const seed = `${SEED_MARK} ${from}.\n\n${handoff}\n\n${next}`;
+		const seed = `${SEED_MARK} ${from}. ${AFTER_CHECKPOINT}\n\n${handoff}\n\n${next}`;
 		let ok = false;
 		try {
 			ok = !(await ctx.newSession({

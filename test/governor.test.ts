@@ -245,6 +245,11 @@ describe("feature 5: rollover", () => {
 	it("asks for the handoff marker, and stores and seeds the handoff without it", async () => {
 		expect(HANDOFF_MARK).toBe("[pcg handoff]");
 		for (const awt of [false, true]) expect(checkpointPrompt(awt)).toContain(`start the reply with the exact line ${HANDOFF_MARK}`);
+		for (const awt of [false, true]) {
+			expect(checkpointPrompt(awt)).toContain("For this turn only");
+			expect(checkpointPrompt(awt)).toContain("does not change the task; its limits end with that reply.");
+			expect(checkpointPrompt(awt)).not.toContain("Do nothing else");
+		}
 		const g = setup({ branch: big(250_000) });
 		g.fire("session_start");
 		g.fire("agent_settled", { aborted: false });
